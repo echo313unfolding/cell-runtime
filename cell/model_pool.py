@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Model pool — manages Ollama, Helix, and llama-server backends for the capsule.
+"""Model pool — manages Ollama, Helix, and llama-server backends for the cell runtime.
 
 Three backends, one GPU:
   - ollama: SmolLM3 (swap via api/chat with num_predict=1)
@@ -111,14 +111,14 @@ class ModelPool:
             return {"error": f"model_path not found for {model}: {model_path}"}
 
         server_script = os.path.expanduser(
-            "~/tools/capsule/affine_server.py")
+            "~/cell-runtime/cell/affine_server.py")
         if not os.path.exists(server_script):
             return {"error": f"affine_server.py not found at {server_script}"}
 
         # Parse port from helix_url
         port = self.helix_url.rsplit(":", 1)[-1].rstrip("/")
 
-        log_path = os.path.expanduser("~/receipts/capsule/helix_server.log")
+        log_path = os.path.expanduser("~/receipts/cell/helix_server.log")
         t0 = time.time()
 
         # Start server in background
@@ -204,7 +204,7 @@ class ModelPool:
         gen_cfg = {"n_ctx": 4096, "n_gpu_layers": 99}
 
         log_path = os.path.expanduser(
-            os.environ.get("CAPSULE_RECEIPTS_DIR", "~/receipts/capsule")
+            os.environ.get("CELL_RECEIPTS_DIR", "~/receipts/cell")
         ) + "/llama_server.log"
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         t0 = time.time()

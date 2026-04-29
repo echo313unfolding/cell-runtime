@@ -1,4 +1,4 @@
-"""Memory Lane — rolling state tracker for the capsule orchestrator.
+"""Memory Lane — rolling state tracker for the cell orchestrator.
 
 Maintains a structured JSON state capsule that evolves with each
 orchestrator event. Two modes:
@@ -52,7 +52,7 @@ Schema:
 
 @dataclass
 class MemoryLane:
-    """Rolling state tracker for capsule sessions."""
+    """Rolling state tracker for cell sessions."""
 
     state: dict = field(default_factory=lambda: dict(EMPTY_STATE))
     event_log: list = field(default_factory=list)

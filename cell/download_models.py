@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download HXQ GGUF models from HuggingFace for the capsule runtime.
+"""Download HXQ GGUF models from HuggingFace for the cell runtime.
 
 Usage:
     python3 download_models.py smollm3           # Download one model

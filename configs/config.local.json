@@ -1,5 +1,5 @@
 {
-  "_schema": "capsule_config.v3",
+  "_schema": "cell_config.v1",
   "_note": "Local config — host paths, not container paths.",
   "llama_server_url": "http://localhost:8080",
   "roster": {
@@ -37,7 +37,7 @@
     "n_predict": 1024
   },
   "logging": {
-    "swap_log": "~/receipts/capsule/swap_log.jsonl",
-    "task_dir": "~/receipts/capsule/tasks/"
+    "swap_log": "~/receipts/cell/swap_log.jsonl",
+    "task_dir": "~/receipts/cell/tasks/"
   }
 }

@@ -2,12 +2,12 @@
 """Capsule MCP Server — expose the 3-model local assistant to Claude Code.
 
 Tools:
-  capsule_status    — current model, roster, swap history
-  capsule_classify  — classify intent and show routing (no generation)
-  capsule_generate  — full pipeline: classify → route → swap → generate → log
+  cell_status    — current model, roster, swap history
+  cell_classify  — classify intent and show routing (no generation)
+  cell_generate  — full pipeline: classify → route → swap → generate → log
 
 Register:
-  claude mcp add --scope user capsule /home/voidstr3m33/tools/capsule/mcp_wrapper.sh
+  claude mcp add --scope user cell /home/voidstr3m33/cell-runtime/cell/mcp_wrapper.sh
 """
 import json
 import sys
@@ -20,9 +20,9 @@ from mcp.types import Tool, TextContent, CallToolResult
 
 # Add tools/ to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from capsule.orchestrator import Orchestrator
+from cell.orchestrator import Orchestrator
 
-server = Server("capsule")
+server = Server("cell")
 
 
 def _orch() -> Orchestrator:
@@ -36,7 +36,7 @@ def _orch() -> Orchestrator:
 async def list_tools() -> list[Tool]:
     return [
         Tool(
-            name="capsule_status",
+            name="cell_status",
             description=(
                 "Show current state of the local 3-model assistant: which model is loaded, "
                 "roster, swap policy, and swap history this session."
@@ -44,7 +44,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
-            name="capsule_classify",
+            name="cell_classify",
             description=(
                 "Classify user input into an intent (coding, security_triage, reasoning, general) "
                 "and show which model would handle it. Does NOT generate or swap — just routing info. "
@@ -62,7 +62,7 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="capsule_generate",
+            name="cell_generate",
             description=(
                 "Full local assistant pipeline: classify intent → route to model → swap if needed → "
                 "generate response → log task receipt. Returns the model's response plus metadata "
@@ -95,11 +95,11 @@ async def list_tools() -> list[Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
     try:
-        if name == "capsule_status":
+        if name == "cell_status":
             return await _handle_status()
-        elif name == "capsule_classify":
+        elif name == "cell_classify":
             return await _handle_classify(arguments)
-        elif name == "capsule_generate":
+        elif name == "cell_generate":
             return await _handle_generate(arguments)
         else:
             return CallToolResult(content=[TextContent(

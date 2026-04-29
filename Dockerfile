@@ -1,5 +1,5 @@
 # Echo Capsule Runtime — 3-model local AI assistant
-# Builds llama.cpp (HXQ fork) + capsule orchestrator
+# Builds llama.cpp (HXQ fork) + cell orchestrator
 #
 # Usage:
 #   docker build -t echo-cell .
@@ -8,8 +8,8 @@
 #   docker run --gpus all -v /path/to/models:/models -it echo-cell --interactive
 #
 # To auto-download models from HF on first run:
-#   docker run --gpus all -v capsule-models:/models echo-cell --download smollm3
-#   docker run --gpus all -v capsule-models:/models echo-cell --download all
+#   docker run --gpus all -v cell-models:/models echo-cell --download smollm3
+#   docker run --gpus all -v cell-models:/models echo-cell --download all
 
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
@@ -42,7 +42,7 @@ COPY --from=builder /build/llama.cpp/build/bin/llama-perplexity /usr/local/bin/
 COPY --from=builder /build/llama.cpp/build/bin/*.so* /usr/local/lib/
 RUN ldconfig
 
-# Copy capsule runtime — preserve package structure so imports work:
+# Copy cell runtime — preserve package structure so imports work:
 #   /app/tools/router.py
 #   /app/tools/task_record.py
 #   /app/cell/__init__.py
@@ -50,7 +50,7 @@ RUN ldconfig
 #   ...
 # orchestrator.py does sys.path.insert(0, parent.parent) → /app/tools/
 # then: from router import classify (finds /app/tools/router.py)
-# and:  from capsule.model_pool import ModelPool (finds /app/cell/)
+# and:  from cell.model_pool import ModelPool (finds /app/cell/)
 WORKDIR /app/cell
 COPY cell/orchestrator.py .
 COPY cell/model_pool.py .

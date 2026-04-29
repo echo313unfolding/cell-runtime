@@ -1,5 +1,5 @@
 {
-  "_schema": "capsule_config.v3",
+  "_schema": "cell_config.v1",
   "_note": "Native ggml config — all models via llama-server (HXQ fork). No Ollama or Python/Triton dependency.",
   "llama_server_url": "http://localhost:8080",
   "roster": {

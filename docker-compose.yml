@@ -1,16 +1,16 @@
 version: "3.8"
 
 services:
-  capsule-gateway:
-    image: echo-capsule
+  cell-gateway:
+    image: echo-cell
     build:
       context: ../..
-      dockerfile: tools/capsule/Dockerfile
+      dockerfile: Dockerfile
     ports:
       - "8800:8800"
     volumes:
-      - capsule-models:/models
-      - capsule-receipts:/receipts
+      - cell-models:/models
+      - cell-receipts:/receipts
     environment:
       - CAPSULE_MODELS_DIR=/models
       - CAPSULE_RECEIPTS_DIR=/receipts
@@ -22,7 +22,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    entrypoint: ["python3", "/app/tools/capsule/gateway.py"]
+    entrypoint: ["python3", "/app/cell/gateway.py"]
     command: ["--port", "8800"]
     restart: unless-stopped
     healthcheck:
@@ -33,5 +33,5 @@ services:
       start_period: 10s
 
 volumes:
-  capsule-models:
-  capsule-receipts:
+  cell-models:
+  cell-receipts:

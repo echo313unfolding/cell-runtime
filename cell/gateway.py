@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """OpenAI-compatible API gateway for the Cell 3-lane runtime.
 
-Wraps the capsule orchestrator behind standard OpenAI endpoints so any
-client that speaks the OpenAI API can use capsule as a drop-in backend.
+Wraps the cell orchestrator behind standard OpenAI endpoints so any
+client that speaks the OpenAI API can use cell as a drop-in backend.
 
 Endpoints:
     POST /v1/chat/completions  — auto-routes or forces a lane
     GET  /v1/models            — lists cell-auto + individual lane models
     GET  /health               — liveness probe
-    GET  /status               — full capsule state (loaded model, swaps, roster)
+    GET  /status               — full cell state (loaded model, swaps, roster)
     GET  /swap-history         — swap event log
 
 Usage:
@@ -166,7 +166,7 @@ def _handle_chat_completions(body: dict) -> tuple[dict, int]:
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the capsule gateway."""
+    """HTTP request handler for the cell gateway."""
 
     def _send_json(self, data: dict, status: int = 200):
         body = json.dumps(data, indent=2).encode()
@@ -288,7 +288,7 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Host to bind to (default: 0.0.0.0)")
     parser.add_argument("--config", "-c", type=str, default=None,
-                        help="Path to capsule config.json")
+                        help="Path to cell config.json")
     args = parser.parse_args()
 
     _orchestrator = Orchestrator(config_path=args.config)

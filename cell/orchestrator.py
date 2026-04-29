@@ -57,9 +57,9 @@ class Orchestrator:
         # Resolve logging paths
         log_cfg = self.config.get("logging", {})
         self.swap_log_path = Path(os.path.expanduser(
-            log_cfg.get("swap_log", "~/receipts/capsule/swap_log.jsonl")))
+            log_cfg.get("swap_log", "~/receipts/cell/swap_log.jsonl")))
         self.task_dir = Path(os.path.expanduser(
-            log_cfg.get("task_dir", "~/receipts/capsule/tasks/")))
+            log_cfg.get("task_dir", "~/receipts/cell/tasks/")))
         self.swap_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -417,7 +417,7 @@ class Orchestrator:
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        prog="capsule",
+        prog="cell",
         description="Cell orchestrator — 3-model local assistant",
     )
     parser.add_argument("text", nargs="*", help="Input text")
@@ -441,7 +441,7 @@ def main():
 
     # Handle download before creating Orchestrator (may not have models yet)
     if args.download:
-        from capsule.download_models import download_model, MODELS
+        from cell.download_models import download_model, MODELS
         targets = list(MODELS.keys()) if args.download == "all" else [args.download]
         models_dir = os.environ.get("CAPSULE_MODELS_DIR", "/models")
         ok = sum(1 for t in targets if download_model(t, models_dir))
@@ -475,8 +475,8 @@ def main():
     elif not sys.stdin.isatty():
         user_input = sys.stdin.read().strip()
     else:
-        print("Usage: capsule <text>", file=sys.stderr)
-        print("       echo 'text' | capsule", file=sys.stderr)
+        print("Usage: cell <text>", file=sys.stderr)
+        print("       echo 'text' | cell", file=sys.stderr)
         sys.exit(1)
 
     if not user_input:
