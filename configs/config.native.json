@@ -1,0 +1,60 @@
+{
+  "_schema": "capsule_config.v3",
+  "_note": "Native ggml config — all models via llama-server (HXQ fork). No Ollama or Python/Triton dependency.",
+  "llama_server_url": "http://localhost:8080",
+  "roster": {
+    "smollm3": {
+      "backend": "llama-server",
+      "gguf": "/models/smollm3-3b-hxq-affine6.gguf",
+      "hf_repo": "EchoLabs33/smollm3-3b-hxq",
+      "hf_file": "smollm3-3b-hxq-affine6.gguf",
+      "intents": ["general", "reasoning", "hybrid_experiment"],
+      "system_prompt": "You are a helpful reasoning assistant. Think step by step. Be concise and precise.",
+      "bpw": 6.28,
+      "size_gib": 2.25,
+      "tok_s": 28.3,
+      "ppl_vs_q8_0_pct": 1.28
+    },
+    "qwen2.5-sentinel": {
+      "backend": "llama-server",
+      "gguf": "/models/qwen2.5-sentinel-hxq-affine6.gguf",
+      "hf_repo": "EchoLabs33/qwen2.5-coder-3b-hxq",
+      "hf_file": "qwen2.5-coder-3b-instruct-hxq-affine6.gguf",
+      "intents": ["security_triage"],
+      "system_prompt": "You are a security triage agent. Analyze alerts, classify severity, and recommend actions. Use available tools when needed. Be precise about indicators of compromise.",
+      "bpw": 6.28,
+      "size_gib": 2.26,
+      "tok_s": 27.8,
+      "ppl_vs_q8_0_pct": 1.05,
+      "_note": "Sentinel uses coder base GGUF with specialized system prompt. For dedicated sentinel GGUF (merged LoRA), substitute the file at mount time."
+    },
+    "qwen2.5-coder": {
+      "backend": "llama-server",
+      "gguf": "/models/qwen2.5-coder-3b-hxq-affine6.gguf",
+      "hf_repo": "EchoLabs33/qwen2.5-coder-3b-hxq",
+      "hf_file": "qwen2.5-coder-3b-instruct-hxq-affine6.gguf",
+      "intents": ["coding"],
+      "system_prompt": "You are a coding assistant. Write clean, correct, well-structured code. Include brief explanations when helpful.",
+      "bpw": 6.28,
+      "size_gib": 2.26,
+      "tok_s": 27.8,
+      "ppl_vs_q8_0_pct": 1.05
+    }
+  },
+  "memory_lane": {
+    "enabled": true,
+    "llm_enhanced": false,
+    "_note": "Set llm_enhanced=true to use loaded Qwen for state refinement (adds ~1s per turn). Programmatic tracking is always on."
+  },
+  "default_model": "smollm3",
+  "swap_policy": "sticky",
+  "generation": {
+    "temperature": 0.0,
+    "n_ctx": 4096,
+    "n_predict": 1024
+  },
+  "logging": {
+    "swap_log": "/receipts/swap_log.jsonl",
+    "task_dir": "/receipts/tasks/"
+  }
+}

@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  capsule-gateway:
+    image: echo-capsule
+    build:
+      context: ../..
+      dockerfile: tools/capsule/Dockerfile
+    ports:
+      - "8800:8800"
+    volumes:
+      - capsule-models:/models
+      - capsule-receipts:/receipts
+    environment:
+      - CAPSULE_MODELS_DIR=/models
+      - CAPSULE_RECEIPTS_DIR=/receipts
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    entrypoint: ["python3", "/app/tools/capsule/gateway.py"]
+    command: ["--port", "8800"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8800/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  capsule-models:
+  capsule-receipts:

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# ech0 — Echo AI terminal: 3-model capsule on Quadro T2000
+#
+# Usage:
+#   ech0 "write a sort function"     Capsule: classify → route → generate
+#   ech0 status                      Show loaded model, roster, backends
+#   ech0 classify "query"            Preview routing without generating
+#   ech0 --tools "audit this file"   Enable tool use (read, grep, shell, escalate)
+#   ech0 --json "query"              JSON output
+#   ech0 --force smollm3 "query"     Override routing
+#   ech0 help                        Show this help
+#
+# Roster:
+#   smollm3              [ollama]  reasoning, general    18.8 tok/s
+#   qwen2.5-sentinel     [helix]   security triage       13.4 tok/s
+#   qwen2.5-coder-3b-hxq [helix]   coding (affine v4)    14.7 tok/s
+
+set -euo pipefail
+
+CAPSULE="$HOME/tools/capsule/orchestrator.py"
+
+show_help() {
+    echo "ech0 — Echo AI terminal (3-model capsule)"
+    echo ""
+    echo "Usage:"
+    echo "  ech0 \"query\"                  Ask anything (auto-routes to best model)"
+    echo "  ech0 --tools \"query\"           Enable tool use (file read, grep, shell, escalate)"
+    echo "  ech0 --json \"query\"            JSON output with full metadata"
+    echo "  ech0 --force MODEL \"query\"     Override routing (smollm3, qwen2.5-sentinel, qwen2.5-coder-3b-hxq)"
+    echo "  ech0 status                    Show loaded model, backends, swap history"
+    echo "  ech0 classify \"query\"          Preview routing (no generation)"
+    echo "  ech0 tools                     List available tools"
+    echo "  ech0 help                      This help"
+    echo ""
+    echo "Roster:"
+    echo "  smollm3              [ollama]  reasoning/general     ~18.8 tok/s"
+    echo "  qwen2.5-sentinel     [helix]   security triage       ~13.4 tok/s"
+    echo "  qwen2.5-coder-3b-hxq [helix]   coding (affine v4)    ~14.7 tok/s"
+    echo ""
+    echo "Pipe input:  echo 'explain quicksort' | ech0"
+}
+
+case "${1:-}" in
+    help|-h|--help)
+        show_help
+        exit 0
+        ;;
+    status|-s)
+        exec python3 "$CAPSULE" --status
+        ;;
+    classify|-c)
+        shift
+        exec python3 "$CAPSULE" --classify-only "$@"
+        ;;
+    tools|--list-tools)
+        exec python3 "$CAPSULE" --list-tools
+        ;;
+    *)
+        # Pass everything through to the capsule
+        ARGS=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --tools|-t)   ARGS+=(--tools); shift ;;
+                --json|-j)    ARGS+=(--json); shift ;;
+                --force|-f)   ARGS+=(--force-model "$2"); shift 2 ;;
+                *)            ARGS+=("$1"); shift ;;
+            esac
+        done
+
+        # If no text args and stdin is a pipe, read from stdin
+        if [[ ${#ARGS[@]} -eq 0 ]] && ! [[ -t 0 ]]; then
+            exec python3 "$CAPSULE" "${ARGS[@]}"
+        elif [[ ${#ARGS[@]} -eq 0 ]]; then
+            show_help
+            exit 0
+        else
+            exec python3 "$CAPSULE" "${ARGS[@]}"
+        fi
+        ;;
+esac

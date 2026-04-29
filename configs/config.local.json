@@ -1,0 +1,43 @@
+{
+  "_schema": "capsule_config.v3",
+  "_note": "Local config — host paths, not container paths.",
+  "llama_server_url": "http://localhost:8080",
+  "roster": {
+    "smollm3": {
+      "backend": "llama-server",
+      "gguf": "~/models/smollm3-3b-hxq-affine6.gguf",
+      "intents": ["general", "reasoning", "hybrid_experiment"],
+      "system_prompt": "You are a helpful reasoning assistant. Think step by step. Be concise and precise.",
+      "tok_s": 28.3
+    },
+    "qwen2.5-sentinel": {
+      "backend": "llama-server",
+      "gguf": "~/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+      "intents": ["security_triage"],
+      "system_prompt": "You are a security triage agent. Analyze alerts, classify severity, and recommend actions. Be precise about indicators of compromise.",
+      "tok_s": 27.8
+    },
+    "qwen2.5-coder": {
+      "backend": "llama-server",
+      "gguf": "~/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+      "intents": ["coding"],
+      "system_prompt": "You are a coding assistant. Write clean, correct, well-structured code. Include brief explanations when helpful.",
+      "tok_s": 27.8
+    }
+  },
+  "memory_lane": {
+    "enabled": true,
+    "llm_enhanced": false
+  },
+  "default_model": "smollm3",
+  "swap_policy": "sticky",
+  "generation": {
+    "temperature": 0.0,
+    "n_ctx": 4096,
+    "n_predict": 1024
+  },
+  "logging": {
+    "swap_log": "~/receipts/capsule/swap_log.jsonl",
+    "task_dir": "~/receipts/capsule/tasks/"
+  }
+}
