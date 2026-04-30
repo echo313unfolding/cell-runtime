@@ -4,16 +4,16 @@ services:
   cell-gateway:
     image: echo-cell
     build:
-      context: ../..
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: cell-runtime/Dockerfile
     ports:
       - "8800:8800"
     volumes:
       - cell-models:/models
       - cell-receipts:/receipts
     environment:
-      - CAPSULE_MODELS_DIR=/models
-      - CAPSULE_RECEIPTS_DIR=/receipts
+      - CELL_MODELS_DIR=/models
+      - CELL_RECEIPTS_DIR=/receipts
       - PYTHONUNBUFFERED=1
     deploy:
       resources:
@@ -22,7 +22,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    entrypoint: ["python3", "/app/cell/gateway.py"]
+    entrypoint: ["python3", "-m", "cell.gateway"]
     command: ["--port", "8800"]
     restart: unless-stopped
     healthcheck:

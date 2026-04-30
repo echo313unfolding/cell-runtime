@@ -9,3 +9,5 @@ build/
 *.safetensors
 .env
 *.sqlite
+.venv/
+*.egg

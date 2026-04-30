@@ -47,16 +47,12 @@ COPY --from=builder /build/llama.cpp/build/bin/llama-perplexity /usr/local/bin/
 COPY --from=builder /build/llama.cpp/build/bin/*.so* /usr/local/lib/
 RUN ldconfig
 
-# Copy cell runtime as a proper Python package:
-#   /app/cell/__init__.py
-#   /app/cell/orchestrator.py
-#   /app/cell/router.py
-#   etc.
-# orchestrator.py imports: from cell.router import classify
+# Install cell runtime as a Python package
 WORKDIR /app
-COPY cell/ ./cell/
-COPY configs/config.native.json ./cell/config.json
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ ./src/
 COPY bin/ech0 /usr/local/bin/ech0
+RUN pip3 install --no-cache-dir .
 
 # Default model directory (mount your GGUFs here)
 VOLUME /models

@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-CAPSULE="$HOME/tools/capsule/orchestrator.py"
+CAPSULE="$(python3 -c "import cell; import os; print(os.path.dirname(cell.__file__))")/orchestrator.py"
 
 show_help() {
     echo "ech0 — Echo AI terminal (3-model capsule)"
