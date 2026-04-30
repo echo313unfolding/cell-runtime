@@ -31,7 +31,7 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 
 # Add tools/ to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from cell.orchestrator import Orchestrator
 
 # Model aliases: these names are exposed in the API

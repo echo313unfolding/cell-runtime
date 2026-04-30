@@ -74,7 +74,7 @@ def download_model(name: str, models_dir: str = "/models"):
 
 
 def main():
-    models_dir = os.environ.get("CAPSULE_MODELS_DIR", "/models")
+    models_dir = os.environ.get("CELL_MODELS_DIR", "/models")
 
     if len(sys.argv) < 2 or "--help" in sys.argv:
         print(__doc__)

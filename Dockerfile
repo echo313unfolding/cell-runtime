@@ -1,5 +1,5 @@
-# Echo Capsule Runtime — 3-model local AI assistant
-# Builds llama.cpp (HXQ fork) + cell orchestrator
+# Cell Runtime — multi-lane local AI orchestrator
+# Builds llama.cpp (HXQ fork) + cell runtime
 #
 # Usage:
 #   docker build -t echo-cell .
@@ -10,6 +10,11 @@
 # To auto-download models from HF on first run:
 #   docker run --gpus all -v cell-models:/models echo-cell --download smollm3
 #   docker run --gpus all -v cell-models:/models echo-cell --download all
+#
+# NOTE: Requires llama.cpp HXQ fork at ../llama.cpp relative to this repo,
+#       or set LLAMA_CPP_DIR build arg.
+
+ARG LLAMA_CPP_DIR=../llama.cpp
 
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
@@ -42,39 +47,27 @@ COPY --from=builder /build/llama.cpp/build/bin/llama-perplexity /usr/local/bin/
 COPY --from=builder /build/llama.cpp/build/bin/*.so* /usr/local/lib/
 RUN ldconfig
 
-# Copy cell runtime — preserve package structure so imports work:
-#   /app/tools/router.py
-#   /app/tools/task_record.py
+# Copy cell runtime as a proper Python package:
 #   /app/cell/__init__.py
 #   /app/cell/orchestrator.py
-#   ...
-# orchestrator.py does sys.path.insert(0, parent.parent) → /app/tools/
-# then: from router import classify (finds /app/tools/router.py)
-# and:  from cell.model_pool import ModelPool (finds /app/cell/)
-WORKDIR /app/cell
-COPY cell/orchestrator.py .
-COPY cell/model_pool.py .
-COPY cell/tool_registry.py .
-COPY cell/config.native.json ./config.json
-COPY cell/__init__.py .
-COPY cell/mcp_server.py .
-COPY cell/mcp_wrapper.sh .
-COPY cell/download_models.py .
-COPY cell/gateway.py .
-COPY tools/router.py /app/tools/
-COPY tools/task_record.py /app/tools/
+#   /app/cell/router.py
+#   etc.
+# orchestrator.py imports: from cell.router import classify
+WORKDIR /app
+COPY cell/ ./cell/
+COPY configs/config.native.json ./cell/config.json
 COPY bin/ech0 /usr/local/bin/ech0
 
 # Default model directory (mount your GGUFs here)
 VOLUME /models
 VOLUME /receipts
 
-ENV CAPSULE_MODELS_DIR=/models
-ENV CAPSULE_RECEIPTS_DIR=/receipts
+ENV CELL_MODELS_DIR=/models
+ENV CELL_RECEIPTS_DIR=/receipts
 ENV PYTHONUNBUFFERED=1
 
 # llama-server port (internal) + gateway port (API surface)
 EXPOSE 8080 8800
 
-ENTRYPOINT ["python3", "/app/cell/orchestrator.py"]
+ENTRYPOINT ["python3", "-m", "cell.orchestrator"]
 CMD ["--help"]

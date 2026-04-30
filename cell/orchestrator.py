@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 # Add tools/ to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from cell.router import classify, route_model
 from cell.task_record import TaskRecord
 from cell.model_pool import ModelPool
@@ -443,7 +443,7 @@ def main():
     if args.download:
         from cell.download_models import download_model, MODELS
         targets = list(MODELS.keys()) if args.download == "all" else [args.download]
-        models_dir = os.environ.get("CAPSULE_MODELS_DIR", "/models")
+        models_dir = os.environ.get("CELL_MODELS_DIR", "/models")
         ok = sum(1 for t in targets if download_model(t, models_dir))
         print(f"\n{ok}/{len(targets)} models ready.")
         return
