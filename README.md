@@ -93,6 +93,37 @@ curl http://localhost:8800/v1/memory/capsule
 curl -X POST http://localhost:8800/v1/memory/reset
 ```
 
+## Specialist Adapters
+
+Lanes can delegate to external specialist pipelines via the adapter interface. The orchestrator finds the right specialist by intent, delegates the full pipeline, and falls back to the generic memory lane if unavailable.
+
+Current specialists:
+- **Sentinel Hybrid Stack v0.1** — security triage via external SSM state + LLM + post-LLM gate (`tools/sentinel/`). Activated when `PYTHONPATH` includes the sentinel package.
+
+For non-security intents (coding, reasoning, general), the generic memory lane handles state tracking.
+
+### Model Compatibility
+
+The runtime is model-pluggable. The external SSM memory and gate live outside the model, so they wrap any compatible llama-server backend. Model quality and instruction-following ability affect triage accuracy, not runtime compatibility.
+
+| Model | Hard20 | Gate TP/FP | Tier |
+|-------|--------|------------|------|
+| Sentinel repair v1 (Qwen + LoRA) | 84% | 6/0 | COMPATIBLE_NATIVE |
+| Qwen2.5-Coder-3B-Instruct | 69% | 3/0 | COMPATIBLE_NATIVE |
+| SmolLM3-3B | 70% | 0/0 | COMPATIBLE_GRAMMAR |
+
+**Tier definitions:**
+- `COMPATIBLE_NATIVE` — works without grammar constraint
+- `COMPATIBLE_GRAMMAR` — needs GBNF grammar for reliable structured output
+- `LOAD_FAIL` — GGUF format not supported by current binary (not a model quality issue)
+
+### Hardware Policy
+
+| Hardware | Strategy |
+|----------|----------|
+| 4GB VRAM (T2000) | One model at a time, sticky sessions, rotate on lane change (~12s swap) |
+| 24GB+ VRAM (3090/4090) | Multi-port hot servers possible, zero swap time |
+
 ## Ecosystem
 
 | Component | Repo | Role |
