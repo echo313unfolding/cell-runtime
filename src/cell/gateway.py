@@ -146,7 +146,7 @@ def _handle_chat_completions(body: dict) -> tuple[dict, int]:
             "completion_tokens": result.get("eval_count", 0),
             "total_tokens": result.get("eval_count", 0),
         },
-        # Capsule-specific metadata (non-standard, safe to include)
+        # Cell-specific metadata (non-standard, safe to include)
         "cell": {
             "task_id": result.get("task_id"),
             "intent": result.get("intent"),
@@ -157,6 +157,9 @@ def _handle_chat_completions(body: dict) -> tuple[dict, int]:
             "wall_time_s": result.get("wall_time_s", 0),
             "receipt": result.get("receipt"),
             "tool_calls": result.get("tool_calls", 0),
+            "specialist_adapter_used": result.get("specialist_adapter_used", False),
+            "specialist": result.get("specialist"),
+            "gate_fired": result.get("gate_fired", False),
         },
     }
     if result.get("escalations"):
@@ -259,6 +262,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         elif path == "/v1/memory/reset":
             _orchestrator.memory.reset()
+            for s in _orchestrator.specialists:
+                s.reset()
             self._send_json({"status": "reset", "turn_count": 0})
 
         else:

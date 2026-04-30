@@ -28,6 +28,7 @@ from cell.tool_registry import (
     ToolRegistry, create_default_registry, parse_tool_calls, ESCALATION_MARKER,
 )
 from cell.memory_lane import MemoryLane
+from cell.specialists import create_specialist_registry, find_specialist
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 MAX_TOOL_TURNS = 5
@@ -53,6 +54,9 @@ class Orchestrator:
         )
         # Wire LLM callback — uses whatever model is currently loaded
         self.memory._llm_call = self._memory_llm_call
+
+        # Specialist adapters (e.g., Sentinel hybrid stack)
+        self.specialists = create_specialist_registry()
 
         # Resolve logging paths
         log_cfg = self.config.get("logging", {})
@@ -302,16 +306,86 @@ class Orchestrator:
                 task.save(str(self.task_dir))
                 return {"error": swap_result["error"], "task": task.to_dict()}
 
-        # 6. Inject memory capsule into input if available
+        # 6. Check for specialist adapter
+        specialist = find_specialist(self.specialists, intent) if not force_model else None
+        specialist_used = False
+
+        if specialist:
+            # Specialist path: delegate to domain-specific pipeline
+            # The specialist handles its own SSM state, LLM calls, and gating.
+            llama_port = int(self.config.get("llama_server_url",
+                            "http://localhost:8080").rsplit(":", 1)[-1])
+            try:
+                spec_result = specialist.handle(user_input, port=llama_port)
+                specialist_used = True
+
+                # Feed specialist output to generic memory lane for cross-lane awareness
+                self.memory.ingest({
+                    "intent": intent,
+                    "model": model,
+                    "user_input": user_input,
+                    "output": spec_result.output,
+                })
+
+                task.set_result(
+                    model=model,
+                    output_text=spec_result.output,
+                    verdict=spec_result.verdict.get("severity", ""),
+                    reasoning=f"Specialist: {spec_result.specialist}",
+                )
+
+                # Build result with specialist receipt
+                wall_time = round(time.time() - t_start, 3)
+                cpu_time = round(time.process_time() - cpu_start, 3)
+                task_dict = task.to_dict()
+                task_dict["cost"] = {
+                    "wall_time_s": wall_time,
+                    "cpu_time_s": cpu_time,
+                    "peak_memory_mb": round(
+                        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),
+                    "python_version": platform.python_version(),
+                    "hostname": platform.node(),
+                    "timestamp_start": start_iso,
+                    "timestamp_end": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+                task_dict["specialist"] = spec_result.receipt
+
+                task_path = self.task_dir / f"task_{task.task_id}.json"
+                with open(task_path, "w") as f:
+                    json.dump(task_dict, f, indent=2)
+
+                self._log_swap(swap_result, task.task_id, intent)
+
+                return {
+                    "task_id": task.task_id,
+                    "intent": intent,
+                    "model": model,
+                    "swapped": swap_result.get("swapped", False),
+                    "swap_time_s": swap_result.get("swap_time_s", 0),
+                    "output": spec_result.output,
+                    "specialist_adapter_used": True,
+                    "specialist": spec_result.specialist,
+                    "gate_fired": spec_result.gate_fired,
+                    "gate_rules": spec_result.gate_rules,
+                    "verdict": spec_result.verdict,
+                    "wall_time_s": wall_time,
+                    "receipt": str(task_path),
+                    "memory_turn": self.memory.state.get("turn_count", 0),
+                }
+            except ImportError:
+                # Specialist not available — fall through to generic path
+                pass
+
+        # 7. Generic path: inject memory capsule and generate
         capsule_ctx = self.memory.get_capsule_prompt()
         augmented_input = user_input
         if capsule_ctx:
             augmented_input = user_input + capsule_ctx
 
-        # 7. Generate (with optional tool loop)
+        # 8. Generate (with optional tool loop)
         gen_result = self._generate(model, augmented_input, use_tools=use_tools)
 
-        # 8. Feed result to memory lane
+        # 9. Feed result to memory lane
         self.memory.ingest({
             "intent": intent,
             "model": model,
@@ -320,7 +394,7 @@ class Orchestrator:
             "tool_calls": gen_result.get("tool_calls", []),
         })
 
-        # 9. Record result
+        # 10. Record result
         eval_ns = gen_result.get("eval_duration", 0)
         eval_count = gen_result.get("eval_count", 0)
         tok_s = eval_count / (eval_ns / 1e9) if eval_ns > 0 else 0
@@ -331,7 +405,7 @@ class Orchestrator:
             reasoning=f"Generated {eval_count} tokens at {tok_s:.1f} tok/s",
         )
 
-        # 10. Save task with cost block
+        # 11. Save task with cost block
         wall_time = round(time.time() - t_start, 3)
         cpu_time = round(time.process_time() - cpu_start, 3)
         task_dict = task.to_dict()
@@ -353,6 +427,7 @@ class Orchestrator:
             "ttft_ns": gen_result.get("prompt_eval_duration", 0),
             "total_duration_ns": gen_result.get("total_duration", 0),
         }
+        task_dict["specialist_adapter_used"] = False
         if tool_calls:
             task_dict["tool_calls"] = tool_calls
         if escalations:
@@ -362,7 +437,7 @@ class Orchestrator:
         with open(task_path, "w") as f:
             json.dump(task_dict, f, indent=2)
 
-        # 11. Log swap
+        # 12. Log swap
         self._log_swap(swap_result, task.task_id, intent)
 
         result = {
@@ -372,6 +447,7 @@ class Orchestrator:
             "swapped": swap_result.get("swapped", False),
             "swap_time_s": swap_result.get("swap_time_s", 0),
             "output": gen_result["content"],
+            "specialist_adapter_used": False,
             "eval_count": eval_count,
             "tok_s": round(tok_s, 2),
             "wall_time_s": wall_time,
@@ -397,6 +473,7 @@ class Orchestrator:
             "swap_history": self.pool.get_swap_history(),
             "swap_count": len(self.pool.get_swap_history()),
             "memory": self.memory.to_dict(),
+            "specialists": [s.state_dict() for s in self.specialists],
         }
 
     def classify_only(self, user_input: str) -> dict:
