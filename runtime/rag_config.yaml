@@ -1,0 +1,36 @@
+# RAG Configuration — document/policy retrieval settings.
+#
+# RAG is SQL FTS-based (no vector store). Primary backend is FGIP FTS5.
+
+primary_backend: fgip_fts5
+fallback_backend: file_search
+
+fgip_fts5:
+  db_path: ~/fgip-engine/fgip.db
+  mode: read_only
+  tables:
+    - claims_fts    # 32K claims, full-text indexed
+    - nodes_fts     # 1905 entity names
+  max_results: 20
+  timeout_s: 10
+
+file_search:
+  root: ~/
+  include:
+    - "*.md"
+    - "*.json"
+    - "*.txt"
+  exclude:
+    - ".git"
+    - "__pycache__"
+    - "node_modules"
+    - ".cache"
+  max_results: 20
+  timeout_s: 5
+
+# Receipt search
+receipt_search:
+  root: ~/receipts/
+  include:
+    - "*.json"
+  max_results: 20

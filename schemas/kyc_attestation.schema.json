@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KYC Attestation",
+  "description": "Mock KYC attestation consumed by the regulated asset adapter. Not real KYC. Not real identity verification. A structured attestation that the risk decision layer can reference.",
+
+  "type": "object",
+  "required": ["attestation_id", "wallet_id_hash", "level", "jurisdiction", "issued_at"],
+  "properties": {
+    "attestation_id": {
+      "type": "string",
+      "description": "Unique attestation identifier"
+    },
+    "wallet_id_hash": {
+      "type": "string",
+      "description": "SHA256 hash of wallet ID (anonymized)"
+    },
+    "level": {
+      "type": "string",
+      "enum": ["none", "basic", "enhanced", "institutional"],
+      "description": "KYC verification level"
+    },
+    "jurisdiction": {
+      "type": "string",
+      "description": "Jurisdiction where KYC was performed"
+    },
+    "issuer": {
+      "type": "string",
+      "description": "Entity that issued the attestation"
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sanctions_screen_pass": {
+      "type": "boolean",
+      "description": "Whether sanctions screening passed"
+    },
+    "pep_screen_pass": {
+      "type": "boolean",
+      "description": "Whether PEP (politically exposed person) screening passed"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  llama-server:
+    image: echo-llama-server:latest
+    build:
+      context: ../..
+      dockerfile: cell-runtime/Dockerfile.llama-server
+    volumes:
+      - /home/voidstr3m33/models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: ["-m", "/models/smollm3-3b-hxq-affine6.gguf", "-ngl", "99", "-c", "4096", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  cell-daemon:
+    image: echo-cell:daemon
+    build:
+      context: ../..
+      dockerfile: cell-runtime/Dockerfile
+    ports:
+      - "8800:8800"
+    volumes:
+      - /home/voidstr3m33/models:/models:ro
+      - /home/voidstr3m33/tools/sentinel:/sentinel:ro
+      - cell-receipts:/receipts
+    environment:
+      - CELL_MODELS_DIR=/models
+      - CELL_RECEIPTS_DIR=/receipts
+      - CELL_ASK_PASS=1
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      llama-server:
+        condition: service_healthy
+    entrypoint: ["python3", "-m", "cell.gateway"]
+    command: ["--port", "8800"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8800/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  cell-receipts:

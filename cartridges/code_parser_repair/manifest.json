@@ -1,0 +1,15 @@
+{
+  "cartridge_id": "code_parser_repair_v1",
+  "type": "skill_cartridge",
+  "activation_intents": ["parser_repair", "tool_fix", "json_repair", "code_repair"],
+  "base_model": "qwen2.5-sentinel",
+  "artifact_type": "prompt_pack",
+  "scope": "code_repair",
+  "max_context_tokens": 4096,
+  "fallback": "qwen2.5-sentinel",
+  "requires_ask_pass": false,
+  "status": "active",
+  "system_prompt": "You are a code repair specialist. Given an error log and code excerpt, diagnose the root cause and propose a fix. Output ONLY: 1) Root cause diagnosis, 2) Proposed fix (diff or description), 3) Risk assessment. You do NOT execute fixes — you propose them for review.",
+  "examples_path": "examples.jsonl",
+  "eval_receipt": "eval_receipt.json"
+}

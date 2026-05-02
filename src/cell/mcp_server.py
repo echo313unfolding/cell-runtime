@@ -34,7 +34,7 @@ def _orch() -> Orchestrator:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    tools = [
         Tool(
             name="cell_status",
             description=(
@@ -91,6 +91,18 @@ async def list_tools() -> list[Tool]:
         ),
     ]
 
+    # Add agent tools from the agent registry
+    orch = _orch()
+    if orch.agent_registry:
+        for info in orch.agent_registry.list_agents():
+            tools.append(Tool(
+                name=info["name"],
+                description=info["description"],
+                inputSchema=info.get("input_schema", {"type": "object", "properties": {}}),
+            ))
+
+    return tools
+
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
@@ -102,6 +114,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
         elif name == "cell_generate":
             return await _handle_generate(arguments)
         else:
+            # Try agent registry
+            orch = _orch()
+            if orch.agent_registry and orch.agent_registry.get(name):
+                return await _handle_agent(name, arguments)
             return CallToolResult(content=[TextContent(
                 type="text", text=f"Unknown tool: {name}"
             )])
@@ -187,6 +203,37 @@ async def _handle_generate(arguments: dict) -> CallToolResult:
             body += f"    Priority: {esc.get('priority', 'normal')}\n"
 
     return CallToolResult(content=[TextContent(type="text", text=body)])
+
+
+async def _handle_agent(name: str, arguments: dict) -> CallToolResult:
+    """Dispatch to a bounded agent from the agent registry."""
+    orch = _orch()
+    result = orch.agent_registry.run(name, arguments)
+
+    if not result.ok:
+        return CallToolResult(content=[TextContent(
+            type="text", text=f"Agent error ({name}): {result.error}"
+        )])
+
+    # Format output
+    lines = []
+    output = result.output
+    for key, value in output.items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, (list, dict)):
+            lines.append(f"{key}: {json.dumps(value, indent=2, default=str)}")
+        else:
+            lines.append(f"{key}: {value}")
+
+    # Append receipt info
+    if result.receipt:
+        lines.append(f"\n--- Receipt ---")
+        lines.append(f"Agent: {result.receipt.get('agent', name)}")
+        lines.append(f"Permission: {result.receipt.get('permission', '?')}")
+        lines.append(f"Wall time: {result.receipt.get('wall_time_s', 0):.3f}s")
+
+    return CallToolResult(content=[TextContent(type="text", text="\n".join(lines))])
 
 
 async def main():

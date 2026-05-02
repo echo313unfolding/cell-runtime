@@ -1,0 +1,24 @@
+{
+  "_schema": "cell_ssm_config.v1",
+  "primary_store": {
+    "type": "sqlite",
+    "path": "~/tools/sentinel/sentinel.db",
+    "tables": {
+      "alerts": "detection events with timestamp, alert_text, source",
+      "verdicts": "classification decisions with severity, is_benign",
+      "investigations": "case tracking",
+      "hash_cache": "content deduplication"
+    },
+    "mode": "read_write"
+  },
+  "runtime_ssm": {
+    "module": "sentinel.memory.handmade_ssm",
+    "path": "~/tools/sentinel/memory/handmade_ssm.py",
+    "description": "Handmade SSM for runtime state accumulation. Updated live per event."
+  },
+  "memory_lane": {
+    "module": "cell.memory_lane",
+    "description": "Programmatic session state capsule. Tracks files, errors, actions across turns.",
+    "llm_enhanced": false
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "cartridge_id": "rule_generation_v1",
+  "type": "skill_cartridge",
+  "activation_intents": ["yara_rule", "sigma_rule", "rule_generate", "detection_rule"],
+  "base_model": "qwen2.5-sentinel",
+  "artifact_type": "prompt_pack",
+  "scope": "detection_rules",
+  "max_context_tokens": 4096,
+  "fallback": "qwen2.5-sentinel",
+  "requires_ask_pass": false,
+  "status": "active",
+  "system_prompt": "You are a detection rule specialist. Given IOCs and policy context, generate YARA or Sigma rules. Include comments explaining each condition. Output ONLY the rule text. You do NOT deploy rules — you propose them for review.",
+  "examples_path": "examples.jsonl",
+  "eval_receipt": "eval_receipt.json"
+}

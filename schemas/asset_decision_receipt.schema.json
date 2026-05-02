@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Regulated Asset Decision Receipt",
+  "description": "Receipt for a regulated asset risk decision. Records the full decision chain: event → context → model → decision → gate.",
+
+  "type": "object",
+  "required": ["receipt_id", "event_id", "decision", "risk_level", "timestamp"],
+  "properties": {
+    "receipt_id": {
+      "type": "string"
+    },
+    "event_id": {
+      "type": "string",
+      "description": "The transfer event that triggered this decision"
+    },
+    "wallet_id_hash": {
+      "type": "string",
+      "description": "SHA256 hash of the originating wallet"
+    },
+    "asset_type": {
+      "type": "string"
+    },
+    "jurisdiction": {
+      "type": "string"
+    },
+    "amount_usd": {
+      "type": "number"
+    },
+    "policy_version": {
+      "type": "string",
+      "description": "Version of the risk policy applied"
+    },
+    "context_pack": {
+      "type": "object",
+      "description": "Context assembled from SSM/RAG/graph",
+      "properties": {
+        "ssm_summary": {"type": "object"},
+        "rag_hits": {"type": "integer"},
+        "graph_neighbors": {"type": "integer"},
+        "kyc_level": {"type": "string"},
+        "oracle_risk_score": {"type": "number"}
+      }
+    },
+    "model_id": {
+      "type": "string",
+      "description": "Model that produced the risk assessment"
+    },
+    "model_output": {
+      "type": "string",
+      "description": "Raw model output"
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["allow", "hold", "review", "reject"],
+      "description": "Final decision after gate"
+    },
+    "risk_level": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"],
+      "description": "Assessed risk level"
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Machine-readable reason codes for the decision"
+    },
+    "gate_result": {
+      "type": "object",
+      "properties": {
+        "action": {"type": "string"},
+        "allowed": {"type": "boolean"}
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "cost": {
+      "type": "object",
+      "description": "Compute cost block (WO-RECEIPT-COST-01)"
+    }
+  }
+}

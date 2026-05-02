@@ -1,0 +1,2 @@
+{"input": "JSON decode error at line 5: Expecting ',' delimiter", "code": "{\"key\": \"value\"\n\"key2\": 42}", "output": "Root cause: Missing comma between key-value pairs at line 1-2 boundary.\nFix: Add comma after \"value\".\nRisk: Low — syntax-only fix."}
+{"input": "TypeError: 'NoneType' object is not subscriptable", "code": "result = api_call()\ndata = result['key']", "output": "Root cause: api_call() returned None instead of dict.\nFix: Add None check: `if result is None: return default`.\nRisk: Low — defensive check, no logic change."}

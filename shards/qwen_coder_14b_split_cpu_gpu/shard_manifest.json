@@ -1,0 +1,30 @@
+{
+  "model_id": "qwen_coder_14b_split_cpu_gpu",
+  "role": "escalation",
+  "type": "monolithic_sharded_model",
+  "backend": "llama_cpp",
+  "load_mode": "cold",
+  "shard_paths": [
+    "/models/qwen2.5-coder-14b-instruct-q5_k_m.gguf"
+  ],
+  "quant_type": "q5_k_m",
+  "offload_policy": {
+    "gpu_layers": 10,
+    "cpu_layers": "remaining",
+    "mmap": true,
+    "mlock": false
+  },
+  "required_ram_mb": 14000,
+  "required_vram_mb": 2000,
+  "context_size": 4096,
+  "activation_intents": [
+    "complex_patch_generation",
+    "multi_file_refactor",
+    "security_audit_deep"
+  ],
+  "fallback": "qwen_coder_7b_q5_local",
+  "idle_unload_s": 180,
+  "status": "candidate",
+  "system_prompt": "You are an advanced code analysis and patch generation specialist. Provide comprehensive, multi-file analysis. You propose — you do NOT execute.",
+  "_note": "9.8GB model. Only 10 GPU layers (mmap rest from disk via CPU). Very slow on T2000 — primarily for pod or future hardware. Status candidate until eval receipt exists."
+}

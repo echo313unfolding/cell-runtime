@@ -1,0 +1,38 @@
+# Shard Registry — monolithic model sharding plans.
+# Actual manifests live in shards/<id>/shard_manifest.json.
+# This file is the summary index for ops/debugging.
+
+shards:
+  qwen_coder_7b_q5_local:
+    role: specialist
+    backend: llama_cpp
+    quant_type: q5_k_m
+    shard_count: 1
+    required_vram_mb: 2500
+    required_ram_mb: 8000
+    gpu_layers: 20
+    mmap: true
+    intents: [deep_code_analysis, patch_generation, tool_repair, repo_refactor]
+    fallback: qwen2.5-sentinel
+    status: candidate
+    note: "Single GGUF, CPU/GPU split. Fits T2000 with offload."
+
+  qwen_coder_14b_split_cpu_gpu:
+    role: escalation
+    backend: llama_cpp
+    quant_type: q5_k_m
+    shard_count: 1
+    required_vram_mb: 2000
+    required_ram_mb: 14000
+    gpu_layers: 10
+    mmap: true
+    intents: [complex_patch_generation, multi_file_refactor, security_audit_deep]
+    fallback: qwen_coder_7b_q5_local
+    status: candidate
+    note: "9.8GB model. Mostly CPU/mmap. Slow on T2000. Pod/future hardware primary."
+
+# Future shards:
+#   wizardcoder_15b_split_mmap:
+#     status: candidate
+#   zamba2_research_q5:
+#     status: candidate

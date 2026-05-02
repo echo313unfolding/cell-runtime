@@ -1,0 +1,83 @@
+# Cell Daemon Policy — what needs approval, what auto-runs.
+#
+# The ask-pass gate reads this at startup. Privileged actions prompt the
+# user for approval. Auto-approve actions run silently. Everything else
+# is denied by default.
+
+# === Tool-level permissions (legacy tools in tool_registry.py) ===
+
+ask_pass:
+  privileged:
+    - shell
+    - delegate_to_host
+    - file_write
+
+  auto_approve:
+    - read_file
+    - grep
+    - list_dir
+    - web_search
+    - memory_search
+
+  # Model swaps: log but don't block
+  model_swap: auto_approve_with_log
+
+# === Agent-level permissions ===
+
+agents:
+  # Read agents: auto-approve, no side effects
+  read:
+    - rag_lookup
+    - rag_search
+    - graph_lookup
+    - graph_neighbors
+    - graph_stats
+    - ssm_get_state
+    - sentinel_triage
+    - gate_decide
+    - receipt_lookup
+
+  # Write agents: auto-approve with log (internal state changes)
+  write:
+    - ssm_update_event
+    - receipt_write
+
+  # Privileged agents: require ask-pass
+  # (none yet — privileged actions stay in tool_registry.py)
+
+# === Escalation policy ===
+
+escalation:
+  # smaLLM detects security intent
+  security_triage: swap_to_sentinel
+  # Sentinel or smaLLM detects need for frontier model
+  tier3_needed: delegate_to_host
+  # Model is stuck / low confidence
+  stuck: delegate_to_host
+
+# === Memory policy ===
+
+memory:
+  mode: programmatic
+  capsule_injection: true
+  max_turns: 100
+
+# === Receipt policy ===
+
+receipts:
+  # Every agent call emits a receipt
+  agent_calls: always
+  # Every model inference emits a receipt
+  model_calls: always
+  # Every memory update emits a receipt
+  memory_updates: on_write
+  # Directory
+  base_dir: ~/receipts/cell/
+
+# === Model policy ===
+
+models:
+  # No candidate promotion without eval receipt
+  promotion_requires_eval: true
+  # No direct sudo from any model
+  no_sudo: true

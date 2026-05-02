@@ -1,0 +1,44 @@
+# Cartridge Registry — maps cartridge IDs to metadata for runtime reference.
+# Actual manifests live in cartridges/<id>/manifest.json.
+# This file is the summary index for ops/debugging.
+
+cartridges:
+  code_parser_repair_v1:
+    scope: code_repair
+    intents: [parser_repair, tool_fix, json_repair, code_repair]
+    artifact_type: prompt_pack
+    base_model: qwen2.5-sentinel
+    status: active
+    dir: cartridges/code_parser_repair/
+
+  rule_generation_v1:
+    scope: detection_rules
+    intents: [yara_rule, sigma_rule, rule_generate, detection_rule]
+    artifact_type: prompt_pack
+    base_model: qwen2.5-sentinel
+    status: active
+    dir: cartridges/rule_generation/
+
+  patch_review_v1:
+    scope: code_review
+    intents: [patch_review, diff_review, code_review]
+    artifact_type: prompt_pack
+    base_model: qwen2.5-sentinel
+    status: active
+    dir: cartridges/patch_review/
+
+  exploit_analysis_v1:
+    scope: security_analysis
+    intents: [exploit_analysis, vuln_analysis, attack_chain]
+    artifact_type: prompt_pack
+    base_model: qwen2.5-sentinel
+    status: active
+    dir: cartridges/exploit_analysis/
+
+  repo_context_v1:
+    scope: repo_understanding
+    intents: [repo_context, codebase_search, file_analysis]
+    artifact_type: rag_index
+    base_model: qwen2.5-sentinel
+    status: active
+    dir: cartridges/repo_context/

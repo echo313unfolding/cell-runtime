@@ -1,0 +1,75 @@
+# Tool Schemas — MCP tool definitions for the local agent substrate.
+#
+# These are the tools exposed via MCP to Claude Code and other clients.
+# Each maps to an agent or direct orchestrator call.
+
+tools:
+  # === Existing cell tools (from mcp_server.py) ===
+
+  cell_status:
+    description: "Show current cell state: loaded model, roster, swap history."
+    input: {}
+    maps_to: orchestrator.status()
+
+  cell_classify:
+    description: "Classify intent and show routing decision. No generation."
+    input:
+      text: { type: string, required: true }
+    maps_to: orchestrator.classify_only()
+
+  cell_generate:
+    description: "Full pipeline: classify -> route -> swap -> generate -> receipt."
+    input:
+      text: { type: string, required: true }
+      force_model: { type: string, required: false }
+      use_tools: { type: boolean, default: false }
+    maps_to: orchestrator.process()
+
+  # === Agent tools (NEW) ===
+
+  rag_lookup:
+    description: "Search documents/policies/receipts by keyword."
+    input:
+      query: { type: string, required: true }
+      scope: { type: string, default: claims }
+      limit: { type: integer, default: 10 }
+    maps_to: agent.rag_lookup
+
+  graph_lookup:
+    description: "Look up an entity in the evidence graph."
+    input:
+      entity: { type: string, required: true }
+    maps_to: agent.graph_lookup
+
+  graph_neighbors:
+    description: "Find entities connected to a given entity."
+    input:
+      entity_id: { type: string, required: true }
+      relation_filter: { type: string, required: false }
+      limit: { type: integer, default: 20 }
+    maps_to: agent.graph_neighbors
+
+  ssm_get_state:
+    description: "Get SSM state for an entity."
+    input:
+      entity_id: { type: string, required: true }
+      limit: { type: integer, default: 10 }
+    maps_to: agent.ssm_get_state
+
+  sentinel_triage:
+    description: "Full Sentinel pipeline with context pack."
+    input:
+      alert_text: { type: string, required: true }
+      entity_id: { type: string, required: false }
+    maps_to: agent.sentinel_triage
+
+  receipt_lookup:
+    description: "Look up a receipt by ID or keyword."
+    input:
+      receipt_id: { type: string, required: true }
+    maps_to: agent.receipt_lookup
+
+  graph_stats:
+    description: "Return evidence graph statistics."
+    input: {}
+    maps_to: agent.graph_stats

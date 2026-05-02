@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "_note": "Schema for HXQ asset receipts. Every HXQ-compressed shard or cartridge tensor must have a receipt matching this schema before promotion to active.",
+
+  "type": "object",
+  "required": ["asset_id", "asset_type", "codec", "sha256_compressed", "cosine_min"],
+  "properties": {
+    "asset_id": {
+      "type": "string",
+      "description": "Unique asset identifier (e.g., qwen_coder_14b_shard_0001)"
+    },
+    "asset_type": {
+      "type": "string",
+      "enum": ["llm_weight_shard", "cartridge_tensor", "adapter", "embedding_index"],
+      "description": "Type of compressed asset"
+    },
+    "codec": {
+      "type": "string",
+      "enum": ["hxq_affine_6", "hxq_affine_g128"],
+      "description": "HXQ codec variant"
+    },
+    "group_size": {
+      "type": "integer",
+      "default": 128,
+      "description": "Quantization group size"
+    },
+    "sha256_original": {
+      "type": "string",
+      "description": "SHA256 of original (uncompressed) tensor data"
+    },
+    "sha256_compressed": {
+      "type": "string",
+      "description": "SHA256 of compressed artifact"
+    },
+    "cosine_min": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Minimum cosine similarity across all tensor groups (must be >= 0.998 for promotion)"
+    },
+    "max_abs_diff": {
+      "type": "number",
+      "description": "Maximum absolute difference between original and reconstructed values"
+    },
+    "ppl_baseline": {
+      "type": "number",
+      "description": "Perplexity of baseline (Q5_K_M or Q8_0) model"
+    },
+    "ppl_compressed": {
+      "type": "number",
+      "description": "Perplexity of HXQ-compressed model"
+    },
+    "ppl_delta_pct": {
+      "type": "number",
+      "description": "PPL change as percentage: (compressed - baseline) / baseline * 100"
+    },
+    "behavioral_eval_pass": {
+      "type": "boolean",
+      "description": "Whether behavioral evaluation passed (same prompts, same tasks, same scoring)"
+    },
+    "behavioral_eval_receipt": {
+      "type": "string",
+      "description": "Path to behavioral evaluation receipt JSON"
+    },
+    "runtime_status": {
+      "type": "string",
+      "enum": ["candidate", "active", "quarantined"],
+      "description": "Current lifecycle status"
+    }
+  },
+
+  "_promotion_rules": {
+    "baseline_to_active": "Requires behavioral_eval_receipt only",
+    "hxq_to_active": "Requires helix_codec_receipt (cosine_min >= 0.998) AND behavioral_eval_receipt",
+    "quarantine": "Set when HXQ eval fails or tensor fidelity drops below threshold",
+    "fallback": "If HXQ load/eval fails, runtime falls back to fallback_shard (standard GGUF)"
+  },
+
+  "_codec_recommendations": {
+    "gpu_edge": "hxq_affine_6 — tighter memory, fits more in VRAM",
+    "cpu_fallback": "hxq_affine_g128 — CPU-friendly, safer packing",
+    "baseline": "q5_k_m — standard GGUF control group",
+    "pod": "q8_0 — highest fidelity for cloud compute"
+  }
+}

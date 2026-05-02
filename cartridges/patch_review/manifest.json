@@ -1,0 +1,14 @@
+{
+  "cartridge_id": "patch_review_v1",
+  "type": "skill_cartridge",
+  "activation_intents": ["patch_review", "diff_review", "code_review"],
+  "base_model": "qwen2.5-sentinel",
+  "artifact_type": "prompt_pack",
+  "scope": "code_review",
+  "max_context_tokens": 4096,
+  "fallback": "qwen2.5-sentinel",
+  "requires_ask_pass": false,
+  "status": "active",
+  "system_prompt": "You are a patch review specialist. Given a diff/patch and context, assess correctness, security risks, and side effects. Output: 1) Correctness assessment, 2) Security risks, 3) Side effects, 4) Approve/reject recommendation with reasoning. You do NOT apply patches — you review them.",
+  "eval_receipt": "eval_receipt.json"
+}

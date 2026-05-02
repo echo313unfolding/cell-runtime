@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Regulated Asset Transfer Event",
+  "description": "Synthetic transfer event for regulated-asset adapter demo. Not a chain, not custody, not settlement. A structured event that the security triage substrate can evaluate.",
+
+  "type": "object",
+  "required": ["event_id", "event_type", "timestamp", "wallet_from", "wallet_to", "asset_type", "amount", "jurisdiction"],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "description": "Unique event identifier (e.g., RA-20260502-0001)"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": ["transfer", "mint", "burn", "swap", "stake", "unstake"],
+      "description": "Type of regulated asset event"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of the event"
+    },
+    "wallet_from": {
+      "type": "string",
+      "description": "Source wallet ID or hash (anonymized)"
+    },
+    "wallet_to": {
+      "type": "string",
+      "description": "Destination wallet ID or hash (anonymized)"
+    },
+    "asset_type": {
+      "type": "string",
+      "enum": ["stablecoin", "security_token", "commodity_token", "cbdc", "utility_token"],
+      "description": "Regulated asset classification"
+    },
+    "amount": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Transfer amount in asset units"
+    },
+    "amount_usd": {
+      "type": "number",
+      "description": "USD-equivalent amount (from oracle)"
+    },
+    "jurisdiction": {
+      "type": "string",
+      "description": "Jurisdiction code (ISO 3166-1 alpha-2, e.g., US, EU, SG)"
+    },
+    "counterparty_jurisdiction": {
+      "type": "string",
+      "description": "Counterparty jurisdiction if cross-border"
+    },
+    "velocity_24h": {
+      "type": "number",
+      "description": "Number of transactions from wallet_from in last 24 hours"
+    },
+    "cumulative_24h_usd": {
+      "type": "number",
+      "description": "Cumulative USD value of transactions from wallet_from in last 24 hours"
+    },
+    "kyc_attestation_id": {
+      "type": "string",
+      "description": "Reference to KYC attestation (if available)"
+    },
+    "oracle_signal_id": {
+      "type": "string",
+      "description": "Reference to oracle price/risk signal (if available)"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Additional event metadata"
+    }
+  }
+}

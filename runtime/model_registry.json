@@ -1,0 +1,28 @@
+{
+  "_schema": "cell_model_registry.v1",
+  "models": {
+    "smollm3": {
+      "role": "front-end",
+      "always_on": true,
+      "gguf": "/models/smollm3-3b-hxq-affine6.gguf",
+      "vram_mb": 2300,
+      "tok_s": 28.3,
+      "intents": ["general", "reasoning", "coding"],
+      "swap_priority": 0
+    },
+    "qwen2.5-sentinel": {
+      "role": "specialist",
+      "always_on": false,
+      "gguf": "/models/sentinel-repair-v1-q8_0.gguf",
+      "vram_mb": 3100,
+      "tok_s": 14.66,
+      "intents": ["security_triage"],
+      "swap_priority": 1,
+      "specialist_adapter": "sentinel_hybrid",
+      "eval_receipt": "receipts/qwen_sentinel_same_200_eval_20260502T185400Z.json"
+    }
+  },
+  "gpu_budget_mb": 4096,
+  "swap_policy": "sticky",
+  "default_model": "smollm3"
+}

@@ -1,0 +1,14 @@
+{
+  "cartridge_id": "repo_context_v1",
+  "type": "skill_cartridge",
+  "activation_intents": ["repo_context", "codebase_search", "file_analysis"],
+  "base_model": "qwen2.5-sentinel",
+  "artifact_type": "rag_index",
+  "scope": "repo_understanding",
+  "max_context_tokens": 4096,
+  "fallback": "qwen2.5-sentinel",
+  "requires_ask_pass": false,
+  "status": "active",
+  "system_prompt": "You are a codebase context specialist. Given a query about a repository, search for relevant files, functions, and patterns. Assemble context from the repo index. Output: 1) Relevant files and symbols, 2) Key patterns found, 3) Context summary for the downstream task.",
+  "eval_receipt": "eval_receipt.json"
+}

@@ -333,4 +333,66 @@ def create_default_registry() -> ToolRegistry:
                   "reason": "Why you're escalating instead of doing it yourself",
                   "priority": "low|normal|high"})
 
+    # Register agent-backed tools
+    _register_agent_tools(reg)
+
     return reg
+
+
+def _register_agent_tools(reg: ToolRegistry):
+    """Register bounded agent tools into the tool registry.
+
+    These let smaLLM call RAG, graph, SSM, sentinel, gate, receipt,
+    and cartridge agents as tools during its tool loop.
+    """
+    from cell.agents.base import AgentRegistry
+    from cell.agents.rag_agent import RAGLookupAgent, RAGSearchAgent
+    from cell.agents.graph_agent import GraphLookupAgent, GraphNeighborsAgent, GraphStatsAgent
+    from cell.agents.ssm_agent import SSMGetStateAgent, SSMUpdateEventAgent
+    from cell.agents.sentinel_agent import SentinelTriageAgent
+    from cell.agents.policy_agent import GateDecideAgent
+    from cell.agents.receipt_agent import ReceiptLookupAgent, ReceiptWriteAgent
+    from cell.agents.cartridge_agent import (
+        CartridgeDispatchAgent, CodeRepairAgent, RuleGenerateAgent,
+        PatchReviewAgent, ExploitAnalysisAgent, CartridgeListAgent,
+    )
+    from cell.agents.specialist_compute_agent import (
+        SpecialistComputeRouteAgent, ShardListAgent, ShardResourceCheckAgent,
+    )
+
+    agent_reg = AgentRegistry()
+    for cls in [RAGLookupAgent, RAGSearchAgent, GraphLookupAgent,
+                GraphNeighborsAgent, GraphStatsAgent, SSMGetStateAgent,
+                SSMUpdateEventAgent, SentinelTriageAgent, GateDecideAgent,
+                ReceiptLookupAgent, ReceiptWriteAgent,
+                CartridgeDispatchAgent, CodeRepairAgent, RuleGenerateAgent,
+                PatchReviewAgent, ExploitAnalysisAgent, CartridgeListAgent,
+                SpecialistComputeRouteAgent, ShardListAgent,
+                ShardResourceCheckAgent]:
+        agent_reg.register(cls())
+
+    def _make_agent_handler(agent_name):
+        def handler(args):
+            result = agent_reg.run(agent_name, args)
+            if result.error:
+                return f"Agent error: {result.error}"
+            output = result.output
+            if result.receipt:
+                output["_receipt"] = result.receipt
+            return output
+        return handler
+
+    for info in agent_reg.list_agents():
+        name = info["name"]
+        # Build args_schema from input_schema properties
+        props = info.get("input_schema", {}).get("properties", {})
+        args_schema = {k: v.get("description", k) for k, v in props.items()}
+        reg.register(
+            name,
+            _make_agent_handler(name),
+            info["description"],
+            args_schema,
+        )
+
+    # Store the agent registry on the tool registry for external access
+    reg._agent_registry = agent_reg

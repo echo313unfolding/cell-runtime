@@ -29,6 +29,7 @@ from cell.tool_registry import (
 )
 from cell.memory_lane import MemoryLane
 from cell.specialists import create_specialist_registry, find_specialist
+from cell.ask_pass import ask_pass
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 MAX_TOOL_TURNS = 5
@@ -46,6 +47,24 @@ class Orchestrator:
         self.gen_opts = self.config.get("generation", {})
 
         self.tool_registry = create_default_registry()
+
+        # Wire agents to orchestrator if available
+        if hasattr(self.tool_registry, '_agent_registry'):
+            self.agent_registry = self.tool_registry._agent_registry
+            # Sentinel needs registry + orchestrator for context pack assembly
+            sentinel_agent = self.agent_registry.get("sentinel_triage")
+            if sentinel_agent:
+                sentinel_agent._agent_registry = self.agent_registry
+                sentinel_agent._orchestrator = self
+            # Cartridge and compute agents need orchestrator for backend dispatch
+            for name in ["cartridge_dispatch", "code_repair", "rule_generate",
+                         "patch_review", "exploit_analysis",
+                         "specialist_compute_route"]:
+                agent = self.agent_registry.get(name)
+                if agent:
+                    agent._orchestrator = self
+        else:
+            self.agent_registry = None
 
         # Memory lane
         mem_cfg = self.config.get("memory_lane", {})
@@ -199,6 +218,20 @@ class Orchestrator:
             for tc in calls:
                 tool_name = tc.get("name", "")
                 tool_args = tc.get("arguments", {})
+
+                # ask-pass gate for privileged actions
+                if not ask_pass(tool_name, json.dumps(tool_args)):
+                    tool_calls_log.append({
+                        "name": tool_name,
+                        "arguments": tool_args,
+                        "result": "Action denied by user.",
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": f"Tool denied ({tool_name}): user declined the action.",
+                    })
+                    continue
+
                 tool_result = self.tool_registry.execute(tool_name, tool_args)
                 tool_calls_log.append({
                     "name": tool_name,

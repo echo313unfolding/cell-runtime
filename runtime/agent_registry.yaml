@@ -1,0 +1,93 @@
+# Agent Registry — bounded workers for the local agent substrate.
+#
+# Every agent is named, schema-validated, and permissioned.
+# No open-ended "go do whatever" agents.
+
+agents:
+  # === READ agents (auto-approve, no side effects) ===
+
+  rag_lookup:
+    module: cell.agents.rag_agent
+    class: RAGLookupAgent
+    permission: read
+    timeout_s: 10
+    description: "Search documents, policies, and receipts by keyword."
+    backends:
+      - fgip.db FTS5 (primary)
+      - file grep (fallback)
+
+  rag_search:
+    module: cell.agents.rag_agent
+    class: RAGSearchAgent
+    permission: read
+    timeout_s: 5
+    description: "Search receipt files by ID or keyword."
+
+  graph_lookup:
+    module: cell.agents.graph_agent
+    class: GraphLookupAgent
+    permission: read
+    timeout_s: 5
+    description: "Look up entity in evidence graph."
+
+  graph_neighbors:
+    module: cell.agents.graph_agent
+    class: GraphNeighborsAgent
+    permission: read
+    timeout_s: 5
+    description: "Find entities connected to a given entity."
+
+  graph_stats:
+    module: cell.agents.graph_agent
+    class: GraphStatsAgent
+    permission: read
+    timeout_s: 3
+    description: "Return graph node/edge/claim counts."
+
+  ssm_get_state:
+    module: cell.agents.ssm_agent
+    class: SSMGetStateAgent
+    permission: read
+    timeout_s: 5
+    description: "Get SSM state for an entity (events, verdicts, trend)."
+
+  sentinel_triage:
+    module: cell.agents.sentinel_agent
+    class: SentinelTriageAgent
+    permission: read
+    timeout_s: 60
+    description: "Full Sentinel pipeline with context pack assembly."
+
+  gate_decide:
+    module: cell.agents.policy_agent
+    class: GateDecideAgent
+    permission: read
+    timeout_s: 30
+    description: "Check if an action is allowed by policy."
+
+  receipt_lookup:
+    module: cell.agents.receipt_agent
+    class: ReceiptLookupAgent
+    permission: read
+    timeout_s: 5
+    description: "Look up a receipt by ID or keyword."
+
+  # === WRITE agents (auto-approve with log) ===
+
+  ssm_update_event:
+    module: cell.agents.ssm_agent
+    class: SSMUpdateEventAgent
+    permission: write
+    timeout_s: 5
+    description: "Record new event in SSM state store."
+
+  receipt_write:
+    module: cell.agents.receipt_agent
+    class: ReceiptWriteAgent
+    permission: write
+    timeout_s: 5
+    description: "Write a receipt for an event/decision."
+
+  # === PRIVILEGED agents (require ask-pass) ===
+  # These are in tool_registry.py (shell, delegate_to_host, file_write)
+  # Not in the agent registry — they go through the tool execution path.

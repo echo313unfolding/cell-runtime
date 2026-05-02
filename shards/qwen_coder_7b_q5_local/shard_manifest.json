@@ -1,0 +1,31 @@
+{
+  "model_id": "qwen_coder_7b_q5_local",
+  "role": "specialist",
+  "type": "monolithic_sharded_model",
+  "backend": "llama_cpp",
+  "load_mode": "cold",
+  "shard_paths": [
+    "/models/qwen2.5-coder-7b-instruct-q5_k_m.gguf"
+  ],
+  "quant_type": "q5_k_m",
+  "offload_policy": {
+    "gpu_layers": 20,
+    "cpu_layers": "remaining",
+    "mmap": true,
+    "mlock": false
+  },
+  "required_ram_mb": 8000,
+  "required_vram_mb": 2500,
+  "context_size": 4096,
+  "activation_intents": [
+    "deep_code_analysis",
+    "patch_generation",
+    "tool_repair",
+    "repo_refactor"
+  ],
+  "fallback": "qwen2.5-sentinel",
+  "idle_unload_s": 300,
+  "status": "candidate",
+  "system_prompt": "You are a deep code analysis specialist. Provide thorough, detailed analysis of code structure, logic, and potential issues. You propose fixes — you do NOT execute them.",
+  "_note": "Single GGUF file with CPU offload. Fits 7B Q5 with ~20 GPU layers on T2000 (2.5GB VRAM) + rest in CPU RAM."
+}
