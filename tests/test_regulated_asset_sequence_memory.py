@@ -362,32 +362,78 @@ def test_kyc_downgrade_escalates_decision():
 # 7. Documented gaps
 # ===========================================================================
 
-def test_no_counterparty_diversity_tracking():
-    """DOCUMENTED GAP: No per-wallet counterparty diversity tracking.
+def test_counterparty_diversity_triggers():
+    """GAP PATCHED (v0.2): High counterparty diversity triggers RC-COUNTERPARTY-DIVERSITY.
 
-    The adapter evaluates each event independently. Counterparty fan-in/out
-    must be detected by the caller updating velocity_24h and cumulative_24h_usd.
+    The caller provides unique_counterparties_24h field.
     """
-    # This test exists to document the gap, not to test missing functionality
-    event = TransferEvent.from_dict(_make_event())
-    result = evaluate_risk_policy(event)
-    # No RC-FAN-IN, RC-FAN-OUT, RC-COUNTERPARTY-DIVERSITY codes exist
-    all_codes = set()
-    for j in ["US", "KP", "SG", "IR"]:
-        e = TransferEvent.from_dict(_make_event(jurisdiction=j))
-        r = evaluate_risk_policy(e)
-        all_codes.update(r["reason_codes"])
-    assert "RC-FAN-IN" not in all_codes
-    assert "RC-FAN-OUT" not in all_codes
-    assert "RC-JURISDICTION-HOP" not in all_codes
-    assert "RC-STRUCTURING" not in all_codes
+    from cell.regulated_asset_adapter import THRESHOLD_COUNTERPARTY_DIVERSITY_24H
+    kyc = KYCAttestation("K1", "x", "enhanced", "US")
+    event = TransferEvent.from_dict(_make_event(
+        unique_counterparties_24h=THRESHOLD_COUNTERPARTY_DIVERSITY_24H + 1,
+    ))
+    result = evaluate_risk_policy(event, kyc=kyc)
+    assert "RC-COUNTERPARTY-DIVERSITY" in result["reason_codes"]
 
 
-def test_no_kyc_expiry_tracking():
-    """DOCUMENTED GAP: No KYC attestation expiry/staleness tracking."""
-    kyc = KYCAttestation("K-OLD", "x", "enhanced", "US")
-    assert not hasattr(kyc, "issued_at")
-    assert not hasattr(kyc, "expires_at")
+def test_counterparty_diversity_below_threshold():
+    """Low counterparty diversity does NOT trigger."""
+    kyc = KYCAttestation("K1", "x", "enhanced", "US")
+    event = TransferEvent.from_dict(_make_event(unique_counterparties_24h=3))
+    result = evaluate_risk_policy(event, kyc=kyc)
+    assert "RC-COUNTERPARTY-DIVERSITY" not in result["reason_codes"]
+
+
+def test_structuring_sequence_triggers():
+    """GAP PATCHED (v0.2): Repeated subthreshold + high cumulative triggers RC-STRUCTURING-SEQUENCE."""
+    from cell.regulated_asset_adapter import (
+        THRESHOLD_SUBTHRESHOLD_REPEAT_24H, THRESHOLD_CUMULATIVE_24H_USD,
+    )
+    kyc = KYCAttestation("K1", "x", "enhanced", "US")
+    event = TransferEvent.from_dict(_make_event(
+        amount=9900, amount_usd=9900,
+        subthreshold_repeat_count_24h=THRESHOLD_SUBTHRESHOLD_REPEAT_24H + 1,
+        cumulative_24h_usd=THRESHOLD_CUMULATIVE_24H_USD + 1,
+    ))
+    result = evaluate_risk_policy(event, kyc=kyc)
+    assert "RC-STRUCTURING-SEQUENCE" in result["reason_codes"]
+    # With structuring (30) + cumulative (20) = 50 → hold
+    assert result["decision"] in ("hold", "reject")
+
+
+def test_structuring_sequence_needs_both():
+    """Structuring requires BOTH repeat count AND cumulative threshold."""
+    from cell.regulated_asset_adapter import (
+        THRESHOLD_SUBTHRESHOLD_REPEAT_24H, THRESHOLD_CUMULATIVE_24H_USD,
+    )
+    kyc = KYCAttestation("K1", "x", "enhanced", "US")
+    # High repeat but low cumulative
+    e1 = TransferEvent.from_dict(_make_event(
+        subthreshold_repeat_count_24h=THRESHOLD_SUBTHRESHOLD_REPEAT_24H + 1,
+        cumulative_24h_usd=1000,
+    ))
+    r1 = evaluate_risk_policy(e1, kyc=kyc)
+    assert "RC-STRUCTURING-SEQUENCE" not in r1["reason_codes"]
+
+    # High cumulative but low repeat
+    e2 = TransferEvent.from_dict(_make_event(
+        subthreshold_repeat_count_24h=1,
+        cumulative_24h_usd=THRESHOLD_CUMULATIVE_24H_USD + 1,
+    ))
+    r2 = evaluate_risk_policy(e2, kyc=kyc)
+    assert "RC-STRUCTURING-SEQUENCE" not in r2["reason_codes"]
+
+
+def test_kyc_expiry_tracking_patched():
+    """GAP PATCHED (v0.2): KYC attestation now has issued_at and max_age_days.
+
+    Stale KYC triggers RC-KYC-STALE.
+    """
+    kyc = KYCAttestation("K-OLD", "x", "enhanced", "US",
+                         issued_at="2020-01-01T00:00:00Z", max_age_days=365)
+    assert hasattr(kyc, "issued_at")
+    assert hasattr(kyc, "max_age_days")
+    assert kyc.is_stale()
 
 
 def test_no_event_deduplication():

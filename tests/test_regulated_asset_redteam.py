@@ -77,17 +77,12 @@ def test_missing_wallet_to():
 
 
 def test_negative_amount():
-    """Negative amount is accepted by parser but policy should handle it.
-
-    The adapter currently doesn't validate amount sign. This test documents
-    that negative amounts produce a clean low-risk result (no threshold triggers).
-    If validation is added later, this test should be updated.
-    """
+    """Negative amount triggers RC-INVALID-AMOUNT (gap patched in v0.2)."""
     event = TransferEvent.from_dict(_make_event(amount=-1000, amount_usd=-1000))
     result = evaluate_risk_policy(event)
-    # Negative won't trigger HIGH-VALUE (< 10000) — produces allow
-    assert result["decision"] in ("allow", "review", "hold", "reject")
-    assert isinstance(result["risk_score"], int)
+    assert "RC-INVALID-AMOUNT" in result["reason_codes"]
+    assert result["risk_score"] >= 50
+    assert result["decision"] in ("hold", "reject")
 
 
 def test_zero_amount():
@@ -162,16 +157,14 @@ def test_unknown_asset_type():
 
 
 def test_wallet_from_equals_wallet_to():
-    """Self-transfer — wallet_from == wallet_to.
-
-    Currently allowed by policy (no self-transfer check). Documents behavior.
-    Both hashes will be identical.
-    """
+    """Self-transfer triggers RC-SELF-TRANSFER (gap patched in v0.2)."""
     event = TransferEvent.from_dict(_make_event(
         wallet_from="same-wallet", wallet_to="same-wallet"))
     assert event.wallet_from_hash == event.wallet_to_hash
+    assert event.is_self_transfer()
     result = evaluate_risk_policy(event)
-    assert isinstance(result["decision"], str)
+    assert "RC-SELF-TRANSFER" in result["reason_codes"]
+    assert result["risk_score"] >= 25
 
 
 def test_empty_wallet_ids():
@@ -432,16 +425,35 @@ def test_oracle_high_risk_clean_event():
     assert result["decision"] == "review"
 
 
-def test_stale_kyc_concept():
-    """KYC attestation has no expiry field — documents the gap.
+def test_stale_kyc_triggers_reason_code():
+    """Stale KYC attestation triggers RC-KYC-STALE.
 
-    Current KYCAttestation has no timestamp/expiry. A stale KYC is
-    treated identically to a fresh one. This is a known limitation.
+    Gap patched in v0.2: KYCAttestation now has issued_at and max_age_days.
     """
-    kyc = KYCAttestation("K-OLD", "x", "enhanced", "US")
-    # No way to mark it as expired in current schema
-    assert not hasattr(kyc, "expires_at")
-    assert not hasattr(kyc, "issued_at")
+    kyc = KYCAttestation("K-OLD", "x", "enhanced", "US",
+                         issued_at="2020-01-01T00:00:00Z", max_age_days=365)
+    assert kyc.is_stale()  # 6+ years old
+    event = TransferEvent.from_dict(_make_event())
+    result = evaluate_risk_policy(event, kyc=kyc)
+    assert "RC-KYC-STALE" in result["reason_codes"]
+
+
+def test_fresh_kyc_no_stale_code():
+    """Fresh KYC does not trigger RC-KYC-STALE."""
+    import time
+    kyc = KYCAttestation("K-NEW", "x", "enhanced", "US",
+                         issued_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                         max_age_days=365)
+    assert not kyc.is_stale()
+    event = TransferEvent.from_dict(_make_event())
+    result = evaluate_risk_policy(event, kyc=kyc)
+    assert "RC-KYC-STALE" not in result["reason_codes"]
+
+
+def test_kyc_no_issued_at_not_stale():
+    """KYC without issued_at is NOT considered stale (can't determine)."""
+    kyc = KYCAttestation("K-UNK", "x", "enhanced", "US")
+    assert not kyc.is_stale()
 
 
 def test_all_sanctioned_jurisdictions():
@@ -467,16 +479,23 @@ def test_both_jurisdictions_sanctioned():
 
 
 def test_kyc_jurisdiction_mismatch():
-    """KYC from one jurisdiction, event from another.
+    """KYC from one jurisdiction, event from another triggers reason code.
 
-    Current policy doesn't check KYC jurisdiction against event jurisdiction.
-    Documents this as a gap.
+    Gap patched in v0.2: RC-KYC-JURISDICTION-MISMATCH fires when
+    kyc.jurisdiction != event.jurisdiction.
     """
     event = TransferEvent.from_dict(_make_event(jurisdiction="US"))
     kyc = KYCAttestation("K1", "x", "enhanced", "JP")  # KYC from Japan
     result = evaluate_risk_policy(event, kyc=kyc)
-    # No reason code for jurisdiction mismatch — known gap
-    assert "RC-CLEAN" in result["reason_codes"]
+    assert "RC-KYC-JURISDICTION-MISMATCH" in result["reason_codes"]
+
+
+def test_kyc_jurisdiction_match_no_code():
+    """Matching KYC and event jurisdiction does NOT trigger mismatch."""
+    event = TransferEvent.from_dict(_make_event(jurisdiction="US"))
+    kyc = KYCAttestation("K1", "x", "enhanced", "US")
+    result = evaluate_risk_policy(event, kyc=kyc)
+    assert "RC-KYC-JURISDICTION-MISMATCH" not in result["reason_codes"]
 
 
 def test_sanctions_screen_fail_with_enhanced_kyc():

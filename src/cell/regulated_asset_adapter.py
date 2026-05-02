@@ -19,12 +19,14 @@ from typing import Optional
 
 
 # Risk policy — deterministic rules applied BEFORE model call
-POLICY_VERSION = "regulated_asset_v0.1"
+POLICY_VERSION = "regulated_asset_v0.2"
 
 # Thresholds
 THRESHOLD_HIGH_VALUE_USD = 10_000
 THRESHOLD_VELOCITY_24H = 20
 THRESHOLD_CUMULATIVE_24H_USD = 50_000
+THRESHOLD_COUNTERPARTY_DIVERSITY_24H = 10
+THRESHOLD_SUBTHRESHOLD_REPEAT_24H = 5
 
 # Sanctioned jurisdictions (synthetic — for demo only)
 SANCTIONED_JURISDICTIONS = {"KP", "IR", "SY", "CU"}
@@ -48,6 +50,8 @@ class TransferEvent:
     counterparty_jurisdiction: str = ""
     velocity_24h: int = 0
     cumulative_24h_usd: float = 0.0
+    unique_counterparties_24h: int = 0
+    subthreshold_repeat_count_24h: int = 0
     kyc_attestation_id: str = ""
     oracle_signal_id: str = ""
     metadata: dict = field(default_factory=dict)
@@ -67,6 +71,8 @@ class TransferEvent:
             counterparty_jurisdiction=d.get("counterparty_jurisdiction", ""),
             velocity_24h=d.get("velocity_24h", 0),
             cumulative_24h_usd=d.get("cumulative_24h_usd", 0),
+            unique_counterparties_24h=d.get("unique_counterparties_24h", 0),
+            subthreshold_repeat_count_24h=d.get("subthreshold_repeat_count_24h", 0),
             kyc_attestation_id=d.get("kyc_attestation_id", ""),
             oracle_signal_id=d.get("oracle_signal_id", ""),
             metadata=d.get("metadata", {}),
@@ -84,6 +90,9 @@ class TransferEvent:
         return bool(self.counterparty_jurisdiction
                     and self.counterparty_jurisdiction != self.jurisdiction)
 
+    def is_self_transfer(self) -> bool:
+        return self.wallet_from == self.wallet_to
+
 
 @dataclass
 class KYCAttestation:
@@ -94,6 +103,23 @@ class KYCAttestation:
     jurisdiction: str
     sanctions_screen_pass: bool = True
     pep_screen_pass: bool = True
+    issued_at: str = ""  # ISO8601 timestamp
+    max_age_days: int = 365  # KYC considered stale after this many days
+
+    def is_stale(self, reference_time: str = "") -> bool:
+        """Check if KYC attestation is older than max_age_days."""
+        if not self.issued_at:
+            return False  # no issue date = can't determine staleness
+        try:
+            from datetime import datetime, timedelta
+            issued = datetime.fromisoformat(self.issued_at.replace("Z", "+00:00"))
+            if reference_time:
+                now = datetime.fromisoformat(reference_time.replace("Z", "+00:00"))
+            else:
+                now = datetime.utcnow().replace(tzinfo=issued.tzinfo)
+            return (now - issued).days > self.max_age_days
+        except (ValueError, TypeError):
+            return False  # unparseable date = can't determine staleness
 
     @classmethod
     def from_dict(cls, d: dict) -> "KYCAttestation":
@@ -104,6 +130,8 @@ class KYCAttestation:
             jurisdiction=d.get("jurisdiction", ""),
             sanctions_screen_pass=d.get("sanctions_screen_pass", True),
             pep_screen_pass=d.get("pep_screen_pass", True),
+            issued_at=d.get("issued_at", ""),
+            max_age_days=d.get("max_age_days", 365),
         )
 
 
@@ -142,6 +170,20 @@ def evaluate_risk_policy(
     """
     reason_codes = []
     risk_score = 0  # 0-100
+
+    # --- Input validation (fail closed) ---
+    try:
+        amount_val = float(event.amount_usd)
+    except (TypeError, ValueError):
+        amount_val = 0
+    if amount_val < 0:
+        reason_codes.append("RC-INVALID-AMOUNT")
+        risk_score += 50
+
+    # --- Self-transfer detection ---
+    if event.is_self_transfer():
+        reason_codes.append("RC-SELF-TRANSFER")
+        risk_score += 25
 
     # --- Sanctions check ---
     if event.jurisdiction in SANCTIONED_JURISDICTIONS:
@@ -199,6 +241,28 @@ def evaluate_risk_policy(
         elif oracle.value > 40:
             reason_codes.append("RC-ORACLE-MEDIUM-RISK")
             risk_score += 10
+
+    # --- KYC staleness ---
+    if kyc and kyc.is_stale(event.timestamp):
+        reason_codes.append("RC-KYC-STALE")
+        risk_score += 15
+
+    # --- KYC jurisdiction mismatch ---
+    if kyc and kyc.jurisdiction and event.jurisdiction:
+        if kyc.jurisdiction != event.jurisdiction:
+            reason_codes.append("RC-KYC-JURISDICTION-MISMATCH")
+            risk_score += 10
+
+    # --- Counterparty diversity ---
+    if event.unique_counterparties_24h > THRESHOLD_COUNTERPARTY_DIVERSITY_24H:
+        reason_codes.append("RC-COUNTERPARTY-DIVERSITY")
+        risk_score += 20
+
+    # --- Structuring sequence ---
+    if (event.subthreshold_repeat_count_24h > THRESHOLD_SUBTHRESHOLD_REPEAT_24H
+            and event.cumulative_24h_usd > THRESHOLD_CUMULATIVE_24H_USD):
+        reason_codes.append("RC-STRUCTURING-SEQUENCE")
+        risk_score += 30
 
     # --- Map score to level and decision ---
     risk_score = min(risk_score, 100)

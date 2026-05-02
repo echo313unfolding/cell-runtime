@@ -52,50 +52,33 @@ Receipt proves. Model cannot override hard policy.
 | **Sequence** | KYC downgrade | Risk increases monotonically | YES | `test_kyc_downgrade_increases_risk` | TESTED |
 | **Sequence** | Jurisdiction hop to sanctioned | Hard reject | YES | `test_jurisdiction_hop_into_sanctioned` | TESTED |
 
-## Known Gaps
+## Gaps Found by Break Tests — Patch Status
 
-### 1. No negative amount validation (KNOWN GAP)
+### 1. Negative amount validation — PATCHED (v0.2)
 
-**Gap:** Negative amounts are accepted and produce valid policy results.
-A negative amount_usd won't trigger HIGH-VALUE threshold (< 10000).
+**Was:** Negative amounts accepted, no threshold triggers.
+**Fix:** `RC-INVALID-AMOUNT` (+50 risk) when `amount_usd < 0`.
+**Test:** `test_negative_amount`
 
-**Impact:** Low. Negative amounts in real systems are reversals/credits,
-which have their own event types. Current policy doesn't handle reversals.
+### 2. Self-transfer detection — PATCHED (v0.2)
 
-**Recommended:** Add validation in `TransferEvent.from_dict()` or a reason
-code `RC-NEGATIVE-AMOUNT`.
+**Was:** `wallet_from == wallet_to` accepted without reason code.
+**Fix:** `RC-SELF-TRANSFER` (+25 risk) when `is_self_transfer()`.
+**Test:** `test_wallet_from_equals_wallet_to`
 
-### 2. No self-transfer detection (KNOWN GAP)
+### 3. Counterparty diversity tracking — PATCHED (v0.2)
 
-**Gap:** `wallet_from == wallet_to` is accepted without any reason code.
+**Was:** No detection of fan-in/fan-out patterns.
+**Fix:** New field `unique_counterparties_24h`. `RC-COUNTERPARTY-DIVERSITY` (+20 risk) when above threshold (10).
+**Test:** `test_counterparty_diversity_triggers`, `test_counterparty_diversity_below_threshold`
 
-**Impact:** Low-medium. Self-transfers are suspicious in asset contexts
-(mixing, layering).
+### 4. KYC expiry/staleness — PATCHED (v0.2)
 
-**Recommended:** Add `RC-SELF-TRANSFER` reason code.
+**Was:** No `issued_at` or expiry tracking.
+**Fix:** `issued_at` and `max_age_days` fields on `KYCAttestation`. `is_stale()` method. `RC-KYC-STALE` (+15 risk).
+**Test:** `test_stale_kyc_triggers_reason_code`, `test_fresh_kyc_no_stale_code`, `test_kyc_no_issued_at_not_stale`
 
-### 3. No counterparty diversity tracking (KNOWN GAP)
-
-**Gap:** The adapter evaluates each event independently. Fan-in/fan-out
-patterns (many wallets → one, one → many) are not detected.
-
-**Impact:** Medium. This is the primary structuring/layering blind spot.
-
-**Recommended:** The caller must track counterparty diversity and encode
-it in event fields (e.g., `unique_counterparties_24h`). Or add a
-`RC-HIGH-COUNTERPARTY-DIVERSITY` reason code with a new field.
-
-### 4. No KYC expiry/staleness tracking (KNOWN GAP)
-
-**Gap:** `KYCAttestation` has no `issued_at` or `expires_at` field.
-A KYC from 5 years ago is treated the same as one from today.
-
-**Impact:** Medium. Stale KYC is a real compliance risk.
-
-**Recommended:** Add `issued_at` and `expires_at` to `KYCAttestation`,
-add `RC-KYC-STALE` reason code.
-
-### 5. No event deduplication (KNOWN GAP)
+### 5. Event deduplication — REMAINING GAP (by design)
 
 **Gap:** The adapter is stateless — same `event_id` can be evaluated
 multiple times with identical results.
@@ -103,27 +86,17 @@ multiple times with identical results.
 **Impact:** Low. Deduplication is the caller's responsibility.
 The adapter is designed to be a pure function.
 
-### 6. No KYC jurisdiction mismatch detection (KNOWN GAP)
+### 6. KYC jurisdiction mismatch — PATCHED (v0.2)
 
-**Gap:** KYC attestation from one jurisdiction, event from another,
-produces no reason code.
+**Was:** KYC from one jurisdiction, event from another, no flag.
+**Fix:** `RC-KYC-JURISDICTION-MISMATCH` (+10 risk) when `kyc.jurisdiction != event.jurisdiction`.
+**Test:** `test_kyc_jurisdiction_mismatch`, `test_kyc_jurisdiction_match_no_code`
 
-**Impact:** Low-medium. Cross-jurisdiction KYC may not be valid.
+### 7. Structuring sequence detection — PATCHED (v0.2)
 
-**Recommended:** Add `RC-KYC-JURISDICTION-MISMATCH` reason code.
-
-### 7. Cumulative-only structuring insufficient for escalation (KNOWN GAP)
-
-**Gap:** With enhanced KYC, RC-CUMULATIVE-HIGH alone adds 20 points
-(below 25 review threshold). Structuring detection requires multiple
-signals to escalate beyond "allow."
-
-**Impact:** Medium. A structurer with good KYC can evade until velocity
-also triggers.
-
-**Recommended:** Add `RC-STRUCTURING` composite reason code that fires
-when cumulative > threshold AND velocity > 10 (below velocity threshold
-but suspicious).
+**Was:** Cumulative-only structuring insufficient with enhanced KYC.
+**Fix:** New field `subthreshold_repeat_count_24h`. `RC-STRUCTURING-SEQUENCE` (+30 risk) when repeat count > 5 AND cumulative > $50K.
+**Test:** `test_structuring_sequence_triggers`, `test_structuring_sequence_needs_both`
 
 ## Design Rules (Enforced by Tests)
 
