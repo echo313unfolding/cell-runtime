@@ -7,13 +7,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from cell.router import classify, route_model
 
 
-def test_general_routes_to_smollm():
-    """General queries route to smaLLM (SmolLM3)."""
-    # "weather" doesn't match any pattern set → general
+def test_general_routes_to_coder():
+    """General queries route to Qwen-Coder (default brain)."""
     intent = classify("tell me about the solar system")
     model = route_model(intent)
     assert intent == "general"
-    assert model == "smollm3"
+    assert model == "qwen2.5-coder"
 
 
 def test_security_routes_to_sentinel():
@@ -33,12 +32,12 @@ def test_coding_routes_to_coder():
     assert model in ("qwen2.5-coder", "qwen2.5-coder:latest")
 
 
-def test_reasoning_routes_to_smollm():
-    """Reasoning queries route to SmolLM3."""
+def test_reasoning_routes_to_coder():
+    """Reasoning queries route to Qwen-Coder (default brain)."""
     intent = classify("explain the theory of relativity step by step")
     model = route_model(intent)
     assert intent in ("reasoning", "general")
-    assert model == "smollm3"
+    assert model == "qwen2.5-coder"
 
 
 def test_security_keywords():

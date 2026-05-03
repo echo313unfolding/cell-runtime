@@ -41,10 +41,10 @@ def test_route_model_returns_valid_model():
         assert model in VALID_MODELS, f"Unknown model '{model}' for intent: {intent}"
 
 
-def test_default_model_is_smollm():
-    """General and reasoning route to SmolLM3 (the front-end)."""
-    assert route_model("general") == "smollm3"
-    assert route_model("reasoning") == "smollm3"
+def test_default_model_is_coder():
+    """General and reasoning route to Qwen-Coder (the default brain)."""
+    assert route_model("general") == "qwen2.5-coder"
+    assert route_model("reasoning") == "qwen2.5-coder"
 
 
 def test_security_routes_to_sentinel():
@@ -67,9 +67,9 @@ def test_single_security_keyword_does_not_trigger():
     assert intent != "security_triage" or classify("just ssh stuff") != "security_triage"
 
 
-def test_unknown_intent_maps_to_smollm():
-    """Unknown intents fall through to smollm3."""
-    assert route_model("nonexistent_intent") == "smollm3"
+def test_unknown_intent_maps_to_coder():
+    """Unknown intents fall through to qwen2.5-coder."""
+    assert route_model("nonexistent_intent") == "qwen2.5-coder"
 
 
 def test_empty_input_is_general():

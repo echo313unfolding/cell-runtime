@@ -126,10 +126,10 @@ def route_model(intent: str) -> str:
     return {
         "security_triage": "qwen2.5-sentinel",
         "coding": "qwen2.5-coder",
-        "general": "smollm3",
-        "reasoning": "smollm3",
-        "hybrid_experiment": "smollm3",
-    }.get(intent, "smollm3")
+        "general": "qwen2.5-coder",
+        "reasoning": "qwen2.5-coder",
+        "hybrid_experiment": "qwen2.5-coder",
+    }.get(intent, "qwen2.5-coder")
 
 
 def dispatch(intent: str, input_text: str, save: bool = False) -> TaskRecord:

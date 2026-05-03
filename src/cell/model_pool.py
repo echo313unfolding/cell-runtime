@@ -186,7 +186,8 @@ class ModelPool:
 
     def _llama_server_start(self, model: str) -> dict:
         """Start llama-server for a GGUF model. Returns status dict."""
-        gguf_path = self.roster.get(model, {}).get("gguf", "")
+        gguf_path = os.path.expanduser(
+            self.roster.get(model, {}).get("gguf", ""))
         if not gguf_path or not os.path.exists(gguf_path):
             return {"error": f"GGUF not found for {model}: {gguf_path}"}
 
@@ -209,6 +210,12 @@ class ModelPool:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         t0 = time.time()
 
+        env = os.environ.copy()
+        # Ensure shared libs are found for locally-built llama-server
+        lib_dir = os.path.dirname(llama_server)
+        if lib_dir:
+            env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+
         self._llama_proc = subprocess.Popen(
             [llama_server,
              "--model", gguf_path,
@@ -218,6 +225,7 @@ class ModelPool:
              "--host", "0.0.0.0"],
             stdout=open(log_path, "w"),
             stderr=subprocess.STDOUT,
+            env=env,
             preexec_fn=os.setsid,
         )
 
