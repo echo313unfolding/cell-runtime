@@ -298,9 +298,8 @@ class ModelPool:
         current_backend = self._backend_for(current) if current and current in self.roster else None
 
         # ── Free VRAM from current backend ──
-        if current_backend == "llama-server" or self._llama_server_alive():
-            self._llama_server_stop()
-            time.sleep(1)
+        # Always check for rogue llama-server processes holding the GPU
+        self._llama_server_stop()
         if current_backend == "helix" or self._helix_alive():
             self._helix_stop()
             time.sleep(2)
