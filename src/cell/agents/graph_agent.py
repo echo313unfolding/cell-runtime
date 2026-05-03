@@ -40,7 +40,8 @@ class GraphLookupAgent(AgentBase):
             cursor = conn.execute(
                 "SELECT * FROM nodes WHERE name LIKE ? LIMIT 10",
                 (f"%{entity}%",))
-            nodes = [dict(row) for row in cursor]
+            raw = cursor.fetchall()
+            nodes = [dict(row) for row in raw]
 
             if not nodes:
                 return AgentResult(output={
@@ -93,10 +94,10 @@ class GraphNeighborsAgent(AgentBase):
                 cursor = conn.execute("""
                     SELECT e.*, ns.name as source_name, nt.name as target_name
                     FROM edges e
-                    LEFT JOIN nodes ns ON e.source_id = ns.id
-                    LEFT JOIN nodes nt ON e.target_id = nt.id
+                    LEFT JOIN nodes ns ON e.from_node_id = ns.node_id
+                    LEFT JOIN nodes nt ON e.to_node_id = nt.node_id
                     WHERE (ns.name LIKE ? OR nt.name LIKE ?)
-                      AND e.relation LIKE ?
+                      AND e.edge_type LIKE ?
                     LIMIT ?
                 """, (f"%{entity_id}%", f"%{entity_id}%",
                       f"%{relation_filter}%", limit))
@@ -104,8 +105,8 @@ class GraphNeighborsAgent(AgentBase):
                 cursor = conn.execute("""
                     SELECT e.*, ns.name as source_name, nt.name as target_name
                     FROM edges e
-                    LEFT JOIN nodes ns ON e.source_id = ns.id
-                    LEFT JOIN nodes nt ON e.target_id = nt.id
+                    LEFT JOIN nodes ns ON e.from_node_id = ns.node_id
+                    LEFT JOIN nodes nt ON e.to_node_id = nt.node_id
                     WHERE ns.name LIKE ? OR nt.name LIKE ?
                     LIMIT ?
                 """, (f"%{entity_id}%", f"%{entity_id}%", limit))
@@ -137,13 +138,16 @@ class GraphStatsAgent(AgentBase):
 
         conn = sqlite3.connect(f"file:{FGIP_DB}?mode=ro", uri=True)
         try:
-            nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
-            edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-            claims = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+            counts = {}
+            for table in ("nodes", "edges", "claims"):
+                try:
+                    counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                except sqlite3.OperationalError:
+                    counts[table] = 0
             return AgentResult(output={
-                "nodes": nodes,
-                "edges": edges,
-                "claims": claims,
+                "nodes": counts["nodes"],
+                "edges": counts["edges"],
+                "claims": counts["claims"],
                 "db_path": FGIP_DB,
             })
         except sqlite3.OperationalError as e:

@@ -7,6 +7,7 @@ Backend: Sentinel SSM state (~/tools/sentinel/sentinel.db)
   - verdicts: classification decisions
   - investigations: case tracking
 """
+import json
 import os
 import sqlite3
 import time
@@ -46,12 +47,14 @@ class SSMGetStateAgent(AgentBase):
         conn = sqlite3.connect(f"file:{SENTINEL_DB}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
-            # Query alerts mentioning this entity
+            # Query alerts mentioning this entity (search across text-bearing columns)
             alerts = []
             try:
                 cursor = conn.execute(
-                    "SELECT * FROM alerts WHERE alert_text LIKE ? ORDER BY timestamp DESC LIMIT ?",
-                    (f"%{entity_id}%", limit))
+                    """SELECT * FROM alerts
+                       WHERE alert_type LIKE ? OR subject_json LIKE ? OR source LIKE ?
+                       ORDER BY timestamp DESC LIMIT ?""",
+                    (f"%{entity_id}%", f"%{entity_id}%", f"%{entity_id}%", limit))
                 alerts = [dict(row) for row in cursor]
             except sqlite3.OperationalError:
                 pass
@@ -60,15 +63,20 @@ class SSMGetStateAgent(AgentBase):
             verdicts = []
             try:
                 cursor = conn.execute(
-                    "SELECT * FROM verdicts WHERE input_text LIKE ? ORDER BY timestamp DESC LIMIT ?",
-                    (f"%{entity_id}%", limit))
+                    """SELECT v.*, a.alert_type, a.subject_json
+                       FROM verdicts v
+                       LEFT JOIN alerts a ON v.alert_id = a.alert_id
+                       WHERE a.alert_type LIKE ? OR a.subject_json LIKE ?
+                          OR v.reasoning LIKE ?
+                       ORDER BY v.verdict_id DESC LIMIT ?""",
+                    (f"%{entity_id}%", f"%{entity_id}%", f"%{entity_id}%", limit))
                 verdicts = [dict(row) for row in cursor]
             except sqlite3.OperationalError:
                 pass
 
             # Compute trend
             event_count = len(alerts)
-            verdict_list = [v.get("severity", "") for v in verdicts]
+            verdict_list = [v.get("verdict", "") for v in verdicts]
 
             return AgentResult(output={
                 "entity": entity_id,
@@ -110,14 +118,21 @@ class SSMUpdateEventAgent(AgentBase):
         try:
             timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+            import hashlib as _hl
+            row_id = _hl.sha256(f"{timestamp}:{entity_id}:{event_data}".encode()).hexdigest()[:16]
+
             if event_type == "alert":
                 conn.execute(
-                    "INSERT INTO alerts (timestamp, alert_text, source) VALUES (?, ?, ?)",
-                    (timestamp, f"[{entity_id}] {event_data}", "ssm_agent"))
+                    """INSERT INTO alerts (alert_id, timestamp, tier, source, alert_type,
+                       severity, subject_json, indicators_json, status)
+                       VALUES (?, ?, 1, 'ssm_agent', ?, 'MEDIUM', ?, '{}', 'NEW')""",
+                    (row_id, timestamp, entity_id, json.dumps({"entity": entity_id, "data": event_data})))
             elif event_type == "verdict":
                 conn.execute(
-                    "INSERT INTO verdicts (timestamp, input_text, severity) VALUES (?, ?, ?)",
-                    (timestamp, f"[{entity_id}] {event_data}", "pending"))
+                    """INSERT INTO verdicts (verdict_id, alert_id, tier, model, verdict,
+                       confidence, reasoning, tool_calls_json, elapsed_ms)
+                       VALUES (?, ?, 1, 'ssm_agent', 'pending', 0.0, ?, '[]', 0.0)""",
+                    (row_id, entity_id, event_data))
 
             conn.commit()
             return AgentResult(output={
