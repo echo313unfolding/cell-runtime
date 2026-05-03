@@ -140,18 +140,24 @@ class Orchestrator:
             "prompt_tokens": usage.get("prompt_tokens", 0),
         }
 
-    def _generate(self, model: str, user_input: str, use_tools: bool = False) -> dict:
-        """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop."""
+    def _generate(self, model: str, user_input: str, use_tools: bool = False,
+                  history: list = None) -> dict:
+        """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
+
+        Args:
+            history: Optional list of prior {"role": ..., "content": ...} messages
+                     for multi-turn chat. Inserted between system prompt and current user turn.
+        """
         backend = self._backend_for(model)
         system_prompt = self.roster.get(model, {}).get(
             "system_prompt", "You are a helpful assistant.")
         if use_tools:
             system_prompt += self.tool_registry.format_for_prompt()
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+        messages = [{"role": "system", "content": system_prompt}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_input})
         opts = {
             "temperature": self.gen_opts.get("temperature", 0.0),
             "num_ctx": self.gen_opts.get("num_ctx", 4096),
@@ -297,7 +303,7 @@ class Orchestrator:
             f.write(json.dumps(entry) + "\n")
 
     def process(self, user_input: str, force_model: str = None,
-                use_tools: bool = False) -> dict:
+                use_tools: bool = False, history: list = None) -> dict:
         """End-to-end: classify → route → swap → generate (with optional tool loop) → log."""
         t_start = time.time()
         cpu_start = time.process_time()
@@ -415,8 +421,9 @@ class Orchestrator:
         if capsule_ctx:
             augmented_input = user_input + capsule_ctx
 
-        # 8. Generate (with optional tool loop)
-        gen_result = self._generate(model, augmented_input, use_tools=use_tools)
+        # 8. Generate (with optional tool loop + conversation history)
+        gen_result = self._generate(model, augmented_input, use_tools=use_tools,
+                                    history=history)
 
         # 9. Feed result to memory lane
         self.memory.ingest({
