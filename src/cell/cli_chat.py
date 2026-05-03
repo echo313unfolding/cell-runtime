@@ -37,8 +37,13 @@ def _slash_help():
 """.strip()
 
 
+CAPSULE_CONFIG = os.path.expanduser("~/tools/capsule/config.json")
+
+
 def run_chat(config_path: str = None, force_model: str = None, use_tools: bool = False):
     """Main REPL loop."""
+    if not config_path and os.path.exists(CAPSULE_CONFIG):
+        config_path = CAPSULE_CONFIG
     orch = Orchestrator(config_path=config_path)
 
     # Session state
