@@ -59,6 +59,41 @@ def decrypt_artifact(ciphertext: bytes, key: bytes, nonce: bytes) -> bytes:
     return aesgcm.decrypt(nonce, ciphertext, None)
 
 
+# ── AAD-Aware Encryption (Gate 9) ───────────────────────────────────────────
+
+def encrypt_with_aad(plaintext: bytes, key: bytes, aad: bytes) -> Tuple[bytes, bytes]:
+    """AES-256-GCM encrypt with additional authenticated data.
+
+    AAD is verified during decryption but never encrypted.
+    Use codebook hash as AAD to bind ciphertext to a specific artifact.
+    Returns (ciphertext, nonce).
+    """
+    nonce = os.urandom(12)
+    aesgcm = AESGCM(key)
+    ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
+    return ciphertext, nonce
+
+
+def decrypt_with_aad(ciphertext: bytes, key: bytes, nonce: bytes, aad: bytes) -> bytes:
+    """Decrypt and verify AAD. Fails if AAD doesn't match (wrong artifact)."""
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ciphertext, aad)
+
+
+def wrap_key(dek: bytes, master_key: bytes) -> Tuple[bytes, bytes]:
+    """AES-256-GCM key wrapping. Returns (wrapped_dek, wrap_nonce)."""
+    nonce = os.urandom(12)
+    aesgcm = AESGCM(master_key)
+    wrapped = aesgcm.encrypt(nonce, dek, None)
+    return wrapped, nonce
+
+
+def unwrap_key(wrapped_dek: bytes, master_key: bytes, wrap_nonce: bytes) -> bytes:
+    """Unwrap DEK. Raises InvalidTag if wrong master key."""
+    aesgcm = AESGCM(master_key)
+    return aesgcm.decrypt(wrap_nonce, wrapped_dek, None)
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
