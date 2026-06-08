@@ -437,20 +437,30 @@ class GlyphDAR:
 
 
 # ---------------------------------------------------------------------------
-# Shadow Memory — the fourth plane
+# Shadow Memory v2 — two-index architecture
 # ---------------------------------------------------------------------------
 # Shadow = measured. Ghost = inferred. Memory = learned.
 #
-# RF localization doesn't build a map from one reflection. It builds a map
-# from reflection + reflection + reflection over time.
+# v1 used SimHash64 Hamming distance as the sole nearest-neighbor metric.
+# Cross-model experiment (2026-06-08, 5 models, 1225 pairs) DISPROVED this:
+#   SimHash64 = content identity (provenance). Does NOT cluster cross-model.
+#   Entropy   = structural signal. DOES cluster cross-model.
 #
-# Shadow Memory stores (shadow, ghost, outcome) tuples. When a new Shadow
-# arrives, nearest-neighbor lookup finds historical Shadows by SimHash
-# Hamming distance. Historical Ghosts vote on the new prediction.
+# v2 splits into two indexes:
+#   IdentityIndex:   key = SimHash64 Hamming distance
+#                    "Have I seen THIS exact window before?"
+#   StructuralIndex: key = entropy band + ghost class
+#                    "What kind of computation is this?"
 #
-# Key question: "Can two different bodies produce similar shadows?"
-# If yes → nearest-neighbor lookup → prior Ghosts → faster inference.
-# "I've seen this pattern before" without opening the body.
+# Three Ghost sources:
+#   identity_ghost()   = from SimHash nearest neighbors (provenance match)
+#   structural_ghost() = from entropy-band neighbors (type match)
+#   consensus_ghost()  = weighted combination of both + historical outcomes
+#
+# Entropy as coordinate space (computational localization):
+#   0---1---2---3---4---5---6---7---8
+#   norm         attn     ffn     emb
+#   New shadow at entropy=5.4 → search "attention neighborhood" first.
 # ---------------------------------------------------------------------------
 
 
@@ -533,40 +543,77 @@ class MemoryEntry:
         )
 
 
+def _entropy_band(entropy: float) -> str:
+    """Map entropy to a discrete band for structural indexing.
+
+    Bands derived from cross-model experiment (2026-06-08):
+      norm: 0-3, attention: 3-5.5, ffn: 5.5-7, embedding: 7-8
+    """
+    if entropy < 3.0:
+        return "norm"
+    elif entropy < 5.5:
+        return "attention"
+    elif entropy < 7.0:
+        return "ffn"
+    else:
+        return "embedding"
+
+
+def _structural_key(shadow: Shadow) -> str:
+    """Build a structural lookup key from entropy band + ghost class.
+
+    This is the computational localization coordinate.
+    Two shadows with the same structural key are "the same kind of thing"
+    regardless of which model or file they came from.
+    """
+    band = _entropy_band(shadow.entropy)
+    cls = shadow.latent_shape.cluster if shadow.latent_shape else ""
+    return f"{band}:{cls}"
+
+
 class ShadowMemory:
-    """Nearest-neighbor index of Shadows with historical Ghost outcomes.
+    """Two-index memory for Shadow observations.
 
     The fourth plane: Shadow = measured, Ghost = inferred, Memory = learned.
 
-    Stores (Shadow, Ghost, Outcome) tuples. When a new Shadow arrives,
-    finds nearest historical Shadows by SimHash64 Hamming distance.
-    Historical Ghosts + Outcomes vote on the new prediction.
+    v2 architecture (2026-06-08): two indexes, not one.
 
-    RF analogy: one reflection = uncertain. Many reflections = map.
-    ShadowMemory is the map.
+    Identity Index (SimHash64 Hamming distance):
+      "Have I seen THIS exact window before?"
+      Good for: cache hits, duplicate detection, exact provenance.
+      DOES NOT cluster across models (proven: all Hamming ~32 cross-model).
+
+    Structural Index (entropy band + ghost class):
+      "What kind of computation is this?"
+      Good for: cross-model routing, type-based prediction, localization.
+      DOES cluster across models (proven: tight entropy bands per class).
+
+    Three Ghost sources:
+      identity_ghost()   — from SimHash neighbors (provenance match)
+      structural_ghost() — from entropy-band neighbors (type match)
+      consensus_ghost()  — weighted combination of both
 
     Usage:
         mem = ShadowMemory()
-
-        # Record observations
         mem.remember(shadow, ghost, outcome, shard_id="blk.0")
 
-        # Query: "have I seen something like this before?"
-        neighbors = mem.recall(new_shadow, k=5)
-
-        # Consensus: historical observations vote on new prediction
-        consensus = mem.consensus_ghost(new_shadow, k=5)
+        # Three views of the same query:
+        id_ghost = mem.identity_ghost(new_shadow, k=5)      # exact match
+        st_ghost = mem.structural_ghost(new_shadow, k=5)     # type match
+        co_ghost = mem.consensus_ghost(new_shadow, k=5)      # combined
     """
 
     def __init__(self):
         self._entries: list[MemoryEntry] = []
+        # Structural index: key = "band:class" → list of entry indices
+        self._structural_index: dict[str, list[int]] = {}
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def remember(self, shadow: Shadow, ghost: Ghost,
                  outcome: Optional[Outcome] = None, shard_id: str = ""):
-        """Store an observation: shadow + ghost + what actually happened."""
+        """Store an observation in both indexes."""
         entry = MemoryEntry(
             shadow=shadow,
             ghost=ghost,
@@ -574,15 +621,19 @@ class ShadowMemory:
             shard_id=shard_id,
             timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
+        idx = len(self._entries)
         self._entries.append(entry)
 
-    def recall(self, query_shadow: Shadow, k: int = 5) -> list[tuple[MemoryEntry, int]]:
-        """Find k nearest historical Shadows by SimHash64 Hamming distance.
+        # Update structural index
+        key = _structural_key(shadow)
+        if key not in self._structural_index:
+            self._structural_index[key] = []
+        self._structural_index[key].append(idx)
 
-        Returns: list of (entry, hamming_distance) sorted by distance.
-        Distance 0 = identical structural fingerprint.
-        Distance 32 = uncorrelated (random).
-        Distance 64 = anti-correlated.
+    def recall(self, query_shadow: Shadow, k: int = 5) -> list[tuple[MemoryEntry, int]]:
+        """Find k nearest by SimHash64 Hamming distance (identity recall).
+
+        Backward-compatible with v1 API.
         """
         if not self._entries:
             return []
@@ -595,19 +646,49 @@ class ShadowMemory:
         scored.sort(key=lambda x: x[1])
         return scored[:k]
 
-    def consensus_ghost(self, query_shadow: Shadow, k: int = 5) -> Optional[Ghost]:
-        """Build a Ghost from nearest historical observations.
+    def recall_structural(self, query_shadow: Shadow, k: int = 5
+                          ) -> list[tuple[MemoryEntry, float]]:
+        """Find k nearest by structural similarity (entropy distance within same band).
 
-        Historical Ghosts vote on class, route, memory. Weighted by
-        inverse Hamming distance. Outcomes (if available) adjust confidence.
-
-        Returns None if memory is empty.
+        Returns: list of (entry, entropy_distance) sorted by distance.
+        Only searches entries in the same entropy band + ghost class.
+        Falls back to same-band entries if exact key has too few.
         """
-        neighbors = self.recall(query_shadow, k=k)
+        if not self._entries:
+            return []
+
+        key = _structural_key(query_shadow)
+        band = _entropy_band(query_shadow.entropy)
+
+        # Collect candidates: exact key first, then same-band fallback
+        candidate_indices = set()
+        if key in self._structural_index:
+            candidate_indices.update(self._structural_index[key])
+
+        # If not enough, expand to same entropy band (any class)
+        if len(candidate_indices) < k:
+            for skey, indices in self._structural_index.items():
+                if skey.startswith(band + ":"):
+                    candidate_indices.update(indices)
+
+        scored = []
+        for idx in candidate_indices:
+            entry = self._entries[idx]
+            dist = abs(query_shadow.entropy - entry.shadow.entropy)
+            scored.append((entry, dist))
+
+        scored.sort(key=lambda x: x[1])
+        return scored[:k]
+
+    def _vote_ghost(self, neighbors: list[tuple[MemoryEntry, float]],
+                    query_shadow: Shadow, weight_fn=None) -> Optional[Ghost]:
+        """Build a Ghost from weighted neighbor votes.
+
+        weight_fn: (distance) → weight. If None, uses 1/(1+dist).
+        """
         if not neighbors:
             return None
 
-        # Vote on shard_class (weighted by inverse distance)
         class_votes: dict[str, float] = {}
         route_votes: dict[str, float] = {}
         memory_sum = 0.0
@@ -615,31 +696,29 @@ class ShadowMemory:
         confidence_sum = 0.0
 
         for entry, dist in neighbors:
-            # Weight: inverse of distance. Distance 0 → weight 64, distance 32 → weight 32.
-            w = 64.0 - dist
+            if weight_fn:
+                w = weight_fn(dist)
+            else:
+                w = 1.0 / (1.0 + dist)
             if w <= 0:
-                w = 0.1  # Floor for anti-correlated neighbors
+                w = 0.01
 
             g = entry.ghost
 
-            # Class vote
             if g.shard_class:
                 class_votes[g.shard_class] = class_votes.get(g.shard_class, 0.0) + w
 
-            # Route vote: prefer outcome.actual_route if available
             route = g.predicted_route
             if entry.outcome and entry.outcome.actual_route:
                 route = entry.outcome.actual_route
             if route:
                 route_votes[route] = route_votes.get(route, 0.0) + w
 
-            # Memory estimate
             if entry.outcome and entry.outcome.actual_memory_mb > 0:
                 memory_sum += entry.outcome.actual_memory_mb * w
             else:
                 memory_sum += g.predicted_memory_mb * w
 
-            # Confidence: higher if outcomes exist and were successful
             if entry.outcome and entry.outcome.success:
                 confidence_sum += w * 1.0
             elif entry.outcome and not entry.outcome.success:
@@ -652,7 +731,6 @@ class ShadowMemory:
         if weight_sum == 0:
             return None
 
-        # Winner-take-all for class and route
         best_class = max(class_votes, key=class_votes.get) if class_votes else ""
         best_route = max(route_votes, key=route_votes.get) if route_votes else ""
 
@@ -663,6 +741,66 @@ class ShadowMemory:
             confidence=round(confidence_sum / weight_sum, 3),
             source_simhash64=query_shadow.simhash64,
         )
+
+    def identity_ghost(self, query_shadow: Shadow, k: int = 5) -> Optional[Ghost]:
+        """Ghost from SimHash nearest neighbors (identity/provenance match).
+
+        Best for: "I've seen this exact window before."
+        Weak for: cross-model structural prediction.
+        """
+        neighbors = self.recall(query_shadow, k=k)
+        if not neighbors:
+            return None
+        # Convert int distance to float for _vote_ghost
+        float_neighbors = [(e, float(d)) for e, d in neighbors]
+        return self._vote_ghost(
+            float_neighbors, query_shadow,
+            weight_fn=lambda d: 64.0 - d if d < 64 else 0.01
+        )
+
+    def structural_ghost(self, query_shadow: Shadow, k: int = 5) -> Optional[Ghost]:
+        """Ghost from entropy-band neighbors (structural/type match).
+
+        Best for: cross-model routing, "what kind of computation is this?"
+        Uses entropy distance within the same structural band.
+        """
+        neighbors = self.recall_structural(query_shadow, k=k)
+        return self._vote_ghost(neighbors, query_shadow)
+
+    def consensus_ghost(self, query_shadow: Shadow, k: int = 5) -> Optional[Ghost]:
+        """Ghost from both indexes, weighted and combined.
+
+        Identity neighbors get weight 0.3 (provenance).
+        Structural neighbors get weight 0.7 (type match).
+        Proven by cross-model experiment: structural signal dominates.
+
+        Backward-compatible with v1 API.
+        """
+        id_neighbors = self.recall(query_shadow, k=k)
+        st_neighbors = self.recall_structural(query_shadow, k=k)
+
+        if not id_neighbors and not st_neighbors:
+            return None
+
+        # Build combined neighbor list with adjusted weights
+        combined: list[tuple[MemoryEntry, float]] = []
+
+        # Identity neighbors: scale distance so closer = smaller
+        for entry, dist in id_neighbors:
+            # Normalize Hamming (0-64) to distance (0-1), then weight down by 0.3
+            # Use inverse: identity weight = 0.3 * (64 - dist) / 64
+            adjusted_dist = dist / 64.0 / 0.3 if dist < 64 else 100.0
+            combined.append((entry, adjusted_dist))
+
+        # Structural neighbors: already entropy distance, weight up by 0.7
+        for entry, dist in st_neighbors:
+            # Normalize entropy distance (typically 0-2) to comparable scale
+            adjusted_dist = dist / 0.7 if dist > 0 else 0.0
+            combined.append((entry, adjusted_dist))
+
+        combined.sort(key=lambda x: x[1])
+        # Take top 2*k to get good coverage from both indexes
+        return self._vote_ghost(combined[:2 * k], query_shadow)
 
     def record_outcome(self, simhash64: int, outcome: Outcome):
         """Attach an execution outcome to the most recent matching entry."""
@@ -696,6 +834,7 @@ class ShadowMemory:
             "with_outcomes": with_outcomes,
             "classes": classes,
             "routes": routes,
+            "structural_bands": {k: len(v) for k, v in self._structural_index.items()},
         }
 
     def save(self, path: str):
@@ -705,10 +844,17 @@ class ShadowMemory:
             json.dump(data, f, indent=2)
 
     def load(self, path: str):
-        """Load memory from JSON."""
+        """Load memory from JSON. Rebuilds structural index."""
         with open(path) as f:
             data = json.load(f)
         self._entries = [MemoryEntry.from_dict(d) for d in data]
+        # Rebuild structural index
+        self._structural_index = {}
+        for idx, entry in enumerate(self._entries):
+            key = _structural_key(entry.shadow)
+            if key not in self._structural_index:
+                self._structural_index[key] = []
+            self._structural_index[key].append(idx)
 
 
 class Intent(Enum):

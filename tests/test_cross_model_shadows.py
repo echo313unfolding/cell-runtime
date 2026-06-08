@@ -39,7 +39,9 @@ from cell.vault_shard import (
     Outcome,
     Shadow,
     ShadowMemory,
+    _entropy_band,
     _hamming64,
+    _structural_key,
 )
 
 
@@ -605,3 +607,182 @@ class TestCrossModelReport:
             print("  [POSITIVE] Majority of close pairs share ghost class — classification")
             print("  is structurally grounded, not random.")
         print(f"{'=' * 70}")
+
+
+class TestTwoIndexMemory:
+    """Compare Identity Ghost vs Structural Ghost vs Consensus Ghost.
+
+    The advisor's key question: which index predicts route, class, and
+    memory usage best on cross-model data?
+
+    Identity Ghost = SimHash nearest neighbors (provenance)
+    Structural Ghost = entropy-band neighbors (type match)
+    Consensus Ghost = weighted combination of both
+    """
+
+    def test_structural_index_populated(self, cross_model_memory):
+        stats = cross_model_memory.stats()
+        assert "structural_bands" in stats
+        assert len(stats["structural_bands"]) >= 2, \
+            f"Expected >= 2 structural bands, got {stats['structural_bands']}"
+
+    def test_structural_recall_returns_same_band(self, cross_model_memory, all_shadows):
+        """Structural recall should return entries from the same entropy band."""
+        for entry in all_shadows[:5]:
+            neighbors = cross_model_memory.recall_structural(entry["shadow"], k=5)
+            if not neighbors:
+                continue
+            query_band = _entropy_band(entry["shadow"].entropy)
+            for neighbor, dist in neighbors:
+                neighbor_band = _entropy_band(neighbor.shadow.entropy)
+                assert neighbor_band == query_band, \
+                    f"Structural recall crossed bands: query={query_band}, neighbor={neighbor_band}"
+
+    def test_three_ghost_comparison(self, cross_model_memory, all_shadows):
+        """The core comparison: which ghost source predicts class best?
+
+        For each shadow, get the single Ghost (from_shadow), identity ghost,
+        structural ghost, and consensus ghost. Compare class predictions
+        against the single Ghost (ground truth for this test).
+        """
+        results = {
+            "identity": {"agree": 0, "disagree": 0, "none": 0},
+            "structural": {"agree": 0, "disagree": 0, "none": 0},
+            "consensus": {"agree": 0, "disagree": 0, "none": 0},
+        }
+
+        for entry in all_shadows:
+            shadow = entry["shadow"]
+            true_class = entry["ghost_class"]
+
+            id_ghost = cross_model_memory.identity_ghost(shadow, k=5)
+            st_ghost = cross_model_memory.structural_ghost(shadow, k=5)
+            co_ghost = cross_model_memory.consensus_ghost(shadow, k=5)
+
+            for name, ghost in [("identity", id_ghost), ("structural", st_ghost),
+                                ("consensus", co_ghost)]:
+                if ghost is None:
+                    results[name]["none"] += 1
+                elif ghost.shard_class == true_class:
+                    results[name]["agree"] += 1
+                else:
+                    results[name]["disagree"] += 1
+
+        print("\n--- Three-Ghost Comparison: Class Prediction Accuracy ---")
+        print(f"  Ground truth: Ghost.from_shadow() class on each window\n")
+
+        for name in ["identity", "structural", "consensus"]:
+            r = results[name]
+            total = r["agree"] + r["disagree"]
+            acc = r["agree"] / max(total, 1)
+            print(f"  {name:12s}: {r['agree']}/{total} ({acc:.1%}) "
+                  f"agree, {r['disagree']} disagree, {r['none']} null")
+
+        # Structural should beat identity for class prediction
+        id_acc = results["identity"]["agree"] / max(results["identity"]["agree"] + results["identity"]["disagree"], 1)
+        st_acc = results["structural"]["agree"] / max(results["structural"]["agree"] + results["structural"]["disagree"], 1)
+
+        print(f"\n  Structural vs Identity delta: {st_acc - id_acc:+.1%}")
+
+        # Structural ghost should be at least as good as identity for class
+        assert st_acc >= id_acc - 0.1, \
+            f"Structural ghost worse than identity by >10%: {st_acc:.1%} vs {id_acc:.1%}"
+
+    def test_three_ghost_route_prediction(self, cross_model_memory, all_shadows):
+        """Which ghost source predicts route best?"""
+        results = {
+            "identity": {"agree": 0, "disagree": 0},
+            "structural": {"agree": 0, "disagree": 0},
+            "consensus": {"agree": 0, "disagree": 0},
+        }
+
+        for entry in all_shadows:
+            shadow = entry["shadow"]
+            true_route = entry["ghost"].predicted_route
+
+            id_ghost = cross_model_memory.identity_ghost(shadow, k=5)
+            st_ghost = cross_model_memory.structural_ghost(shadow, k=5)
+            co_ghost = cross_model_memory.consensus_ghost(shadow, k=5)
+
+            for name, ghost in [("identity", id_ghost), ("structural", st_ghost),
+                                ("consensus", co_ghost)]:
+                if ghost is None:
+                    continue
+                if ghost.predicted_route == true_route:
+                    results[name]["agree"] += 1
+                else:
+                    results[name]["disagree"] += 1
+
+        print("\n--- Three-Ghost Comparison: Route Prediction Accuracy ---")
+        for name in ["identity", "structural", "consensus"]:
+            r = results[name]
+            total = r["agree"] + r["disagree"]
+            acc = r["agree"] / max(total, 1)
+            print(f"  {name:12s}: {r['agree']}/{total} ({acc:.1%})")
+
+    def test_three_ghost_confidence_comparison(self, cross_model_memory, all_shadows):
+        """Compare confidence levels across the three ghost sources."""
+        confidences = {"identity": [], "structural": [], "consensus": []}
+
+        for entry in all_shadows:
+            shadow = entry["shadow"]
+            id_ghost = cross_model_memory.identity_ghost(shadow, k=5)
+            st_ghost = cross_model_memory.structural_ghost(shadow, k=5)
+            co_ghost = cross_model_memory.consensus_ghost(shadow, k=5)
+
+            if id_ghost:
+                confidences["identity"].append(id_ghost.confidence)
+            if st_ghost:
+                confidences["structural"].append(st_ghost.confidence)
+            if co_ghost:
+                confidences["consensus"].append(co_ghost.confidence)
+
+        print("\n--- Three-Ghost Comparison: Confidence Levels ---")
+        for name in ["identity", "structural", "consensus"]:
+            vals = confidences[name]
+            if vals:
+                print(f"  {name:12s}: mean={sum(vals)/len(vals):.3f}, "
+                      f"min={min(vals):.3f}, max={max(vals):.3f}, n={len(vals)}")
+
+    def test_structural_ghost_cross_model_coverage(self, cross_model_memory, all_shadows):
+        """Does structural recall find neighbors from OTHER models?
+
+        This is the key test: structural indexing should enable cross-model
+        knowledge transfer that SimHash-based identity indexing cannot.
+        """
+        cross_model_structural = 0
+        cross_model_identity = 0
+        total = 0
+
+        for entry in all_shadows:
+            shadow = entry["shadow"]
+            query_model = entry["model_key"]
+
+            # Check structural neighbors
+            st_neighbors = cross_model_memory.recall_structural(shadow, k=3)
+            for neighbor, _ in st_neighbors:
+                nn_model = neighbor.shard_id.split(":")[0] if ":" in neighbor.shard_id else ""
+                if nn_model != query_model:
+                    cross_model_structural += 1
+                total += 1
+
+        # Reset total for identity
+        id_total = 0
+        for entry in all_shadows:
+            shadow = entry["shadow"]
+            query_model = entry["model_key"]
+
+            id_neighbors = cross_model_memory.recall(shadow, k=3)
+            for neighbor, _ in id_neighbors:
+                nn_model = neighbor.shard_id.split(":")[0] if ":" in neighbor.shard_id else ""
+                if nn_model != query_model:
+                    cross_model_identity += 1
+                id_total += 1
+
+        st_rate = cross_model_structural / max(total, 1)
+        id_rate = cross_model_identity / max(id_total, 1)
+
+        print(f"\n--- Cross-Model Neighbor Coverage ---")
+        print(f"  Structural index: {cross_model_structural}/{total} ({st_rate:.1%}) cross-model")
+        print(f"  Identity index:   {cross_model_identity}/{id_total} ({id_rate:.1%}) cross-model")
+        print(f"  Delta: {st_rate - id_rate:+.1%}")
