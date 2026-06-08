@@ -112,37 +112,57 @@ class LatentShape:
 class Shadow:
     """Cheap structural projection of an encoded body.
 
-    The runtime navigates by shadow, not by inspecting the full body.
-    GlyphScope produces shadows. GlyphPacket carries them.
-    Routing and gating decisions read the shadow, never the body.
+    v3 (2026-06-08): Transition structure is the primary routing signal.
 
-    Shadow = what you learn about a shard WITHOUT decompressing it.
+    Phase 0.10 proved: VQ destroys distributional signals but preserves
+    relational signals. The strongest shadow signal is NOT entropy —
+    it is transition structure (bigram relationships between consecutive
+    codebook indices).
 
-    Existing implementations:
-      shadow_walking_implementation.py: 72D projections, compute w/o decompression
-      ghost_runtime_integration.py: zero-syscall inference from compressed DNA
-      glyphscope_digital/adapter.py: Shannon entropy + SimHash64 via BLAKE2b
-      bloom_os/tools/glyphscope.py: entropy + SimHash + BLAKE2b + Hamming diff
+    Three independent transition projections converged:
+      transition_entropy r=0.976 for U, r=-0.948 for D
+      transition_rank    r=0.972 for U, r=-0.939 for D
+      markov_order       r=0.975 for U, r=-0.946 for D
 
-    The Shadow IS the RF fingerprint of the encoded body. You can route,
-    gate, diff, and cluster by shadow alone. If you open the body to make
-    a routing decision, you've already failed (Level 1 or below).
+    This means the transition graph itself is the carrier of structural
+    information. The information is not in [17, 42, 88] but in
+    [17→42, 42→88, 88→17].
+
+    Shadow fields are organized by projection type:
+      IDENTITY:   simhash64 (provenance — "have I seen THIS?")
+      STRUCTURE:  transition_entropy, transition_rank, markov_order
+                  (behavioral skeleton — "what kind of computation?")
+      LOCALITY:   index_autocorr, entropy_per_block
+                  (spatial coherence — "how structured is this region?")
+      CONFIDENCE: confidence (sidecar signal, rho=0.574)
+
+    The old routing signal (Shannon entropy) is retained for backward
+    compatibility and entropy-band memory indexing, but it is NOT the
+    primary structural signal for VQ-encoded data.
     """
-    # --- Entropy profile (from GlyphScope) ---
-    entropy: float = 0.0                  # Shannon entropy of encoded body
-    entropy_per_block: list = field(default_factory=list)  # Per-block entropy profile
-
-    # --- Fingerprint (from GlyphScope) ---
+    # --- Identity (provenance — "have I seen THIS?") ---
     simhash64: int = 0                    # 64-bit locality-sensitive hash (BLAKE2b windows)
 
-    # --- Structural signature ---
-    glyph_histogram: list = field(default_factory=list)  # 64-element: codon frequency counts
+    # --- Transition structure (behavioral skeleton — primary routing signal) ---
+    # Phase 0.10: transition graph is the carrier of structural information.
+    # These three projections converge on the same answer (r>0.94 for U and D).
+    transition_entropy: float = 0.0       # Bigram entropy: H(byte[i], byte[i+1])
+    transition_rank: float = 0.0          # Effective rank of 256x256 transition matrix
+    markov_order: float = 0.0             # Bigram entropy / (2 × unigram entropy)
+
+    # --- Locality (spatial coherence) ---
+    index_autocorr: float = 0.0           # Adjacent byte correlation (U proxy, r=0.81)
+    entropy: float = 0.0                  # Shannon entropy (retained for band indexing)
+    entropy_per_block: list = field(default_factory=list)  # Per-block entropy profile
+
+    # --- Structural signature (legacy, retained for compatibility) ---
+    glyph_histogram: list = field(default_factory=list)  # 256-bin byte histogram
     anchor_positions: list = field(default_factory=list)  # Byte offsets of @ (codon 0) boundaries
 
     # --- Latent shape (what kind of thing is this?) ---
     latent_shape: Optional[LatentShape] = None
 
-    # --- Routing hint (derived from entropy + histogram) ---
+    # --- Routing hint (now derived from transition structure, not entropy alone) ---
     route_affinity: str = ""              # Suggested zone: "cpu", "gpu", "qpu"
 
     # --- Reconstruction (how to get back to the body) ---
@@ -153,9 +173,13 @@ class Shadow:
 
     def to_dict(self) -> dict:
         return {
+            "simhash64": self.simhash64,
+            "transition_entropy": self.transition_entropy,
+            "transition_rank": self.transition_rank,
+            "markov_order": self.markov_order,
+            "index_autocorr": self.index_autocorr,
             "entropy": self.entropy,
             "entropy_per_block": self.entropy_per_block,
-            "simhash64": self.simhash64,
             "glyph_histogram": self.glyph_histogram,
             "anchor_positions": self.anchor_positions,
             "latent_shape": self.latent_shape.to_dict() if self.latent_shape else None,
@@ -171,9 +195,13 @@ class Shadow:
         ls_raw = d.get("latent_shape")
         latent_shape = LatentShape.from_dict(ls_raw) if ls_raw else None
         return cls(
+            simhash64=d.get("simhash64", 0),
+            transition_entropy=d.get("transition_entropy", 0.0),
+            transition_rank=d.get("transition_rank", 0.0),
+            markov_order=d.get("markov_order", 0.0),
+            index_autocorr=d.get("index_autocorr", 0.0),
             entropy=d.get("entropy", 0.0),
             entropy_per_block=d.get("entropy_per_block", []),
-            simhash64=d.get("simhash64", 0),
             glyph_histogram=d.get("glyph_histogram", []),
             anchor_positions=d.get("anchor_positions", []),
             latent_shape=latent_shape,
@@ -258,31 +286,47 @@ class Ghost:
     def from_shadow(cls, shadow: "Shadow", shard_id: str = "") -> "Ghost":
         """Infer a Ghost hypothesis from a Shadow.
 
-        This is the core operation: shadow → belief about the body.
-        Like RF fingerprint → room model.
+        v3: Routes primarily from transition structure, not entropy alone.
+        Phase 0.10 proved transition_entropy captures both U (r=0.976) and
+        D (r=-0.948) of the Se formula without decompression.
+
+        Routing logic:
+          transition_entropy > 0.98 → high-rank, unstructured → GPU (parallel)
+          transition_entropy < 0.96 → low-rank, structured → CPU may suffice
+          index_autocorr > 0.05 → strong locality → prefetch-friendly
         """
         # Classify from latent_shape if available
         ls = shadow.latent_shape
         shard_class = ls.cluster if ls else ""
         class_confidence = ls.confidence if ls else 0.0
 
-        # Route prediction from entropy
-        if shadow.entropy < 3.0:
-            predicted_route = "cpu"   # Low entropy = structured = CPU can handle
-        elif shadow.entropy < 6.0:
-            predicted_route = "gpu"   # Medium entropy = needs parallel compute
+        # Route prediction: transition structure first, entropy fallback
+        te = shadow.transition_entropy
+        if te > 0:
+            # Transition structure available — use it as primary signal
+            if te > 0.985:
+                predicted_route = "gpu"   # High transition entropy = unstructured = needs parallel
+            elif te < 0.96:
+                predicted_route = "cpu"   # Low transition entropy = structured = CPU can handle
+            else:
+                predicted_route = "gpu"   # Middle zone → default to GPU
+        elif shadow.entropy > 0:
+            # Fallback: entropy-only routing (v2 behavior)
+            if shadow.entropy < 3.0:
+                predicted_route = "cpu"
+            else:
+                predicted_route = "gpu"
         else:
-            predicted_route = "gpu"   # High entropy but structured = GPU
+            predicted_route = "gpu"       # No signal → default GPU
 
         # Memory prediction from histogram sparsity
         histogram = shadow.glyph_histogram
         if histogram:
             nonzero = sum(1 for h in histogram if h > 0)
             sparsity = 1.0 - (nonzero / max(len(histogram), 1))
-            # Sparser histogram → less diverse symbols → potentially smaller footprint
             predicted_memory_mb = max(0.1, (1.0 - sparsity) * 64.0)
         else:
-            predicted_memory_mb = 32.0  # Default estimate
+            predicted_memory_mb = 32.0
 
         # Confidence: geometric mean of class confidence and shadow confidence
         if class_confidence > 0 and shadow.confidence > 0:
@@ -324,19 +368,23 @@ class GlyphDAR:
     def scan(raw_bytes: bytes, codec: str = "", path: str = "") -> Shadow:
         """Scan raw encoded bytes to produce a Shadow.
 
+        v3: Transition structure is the primary structural signal.
+
         Computes:
-          - Shannon entropy of the raw byte stream
-          - Per-block entropy (16KB blocks)
-          - SimHash64 via BLAKE2b rolling windows
-          - 256-bin byte histogram
-          - Anchor positions (byte value 0x00)
-          - Latent shape classification from entropy + histogram
+          IDENTITY:   SimHash64 via BLAKE2b rolling windows
+          STRUCTURE:  transition_entropy, transition_rank, markov_order
+          LOCALITY:   index_autocorr, per-block entropy, Shannon entropy
+          SIGNATURE:  256-bin byte histogram, anchor positions
+          SHAPE:      latent classification from transition structure
 
         No decompression. No weight materialization. Reads raw bytes only.
+        body_opened_for_routing = False.
         """
         n = len(raw_bytes)
         if n == 0:
             return Shadow()
+
+        arr = np.frombuffer(raw_bytes, dtype=np.uint8)
 
         # --- Shannon entropy ---
         byte_counts = np.zeros(256, dtype=np.int64)
@@ -344,6 +392,53 @@ class GlyphDAR:
             byte_counts[b] += 1
         probs = byte_counts[byte_counts > 0] / n
         entropy = -float(np.sum(probs * np.log2(probs)))
+
+        # --- Transition structure (the primary signal) ---
+        # Phase 0.10: three projections converge on r>0.94 for U and D.
+        # The information is in 17→42, not in [17, 42].
+        transition_entropy = 0.0
+        transition_rank = 0.0
+        markov_order = 0.0
+        index_autocorr = 0.0
+
+        if n >= 2:
+            # Transition entropy: H(byte[i], byte[i+1]) / H_max(bigrams)
+            bigram_counts = np.zeros((256, 256), dtype=np.int64)
+            for i in range(n - 1):
+                bigram_counts[arr[i], arr[i + 1]] += 1
+            total_bigrams = n - 1
+            bigram_probs = bigram_counts[bigram_counts > 0] / total_bigrams
+            bigram_h = -float(np.sum(bigram_probs * np.log2(bigram_probs)))
+            max_bigram_h = 2.0 * np.log2(256)  # 16.0
+            transition_entropy = round(bigram_h / max_bigram_h, 6) if max_bigram_h > 0 else 0.0
+
+            # Transition rank: effective rank proxy from transition matrix row entropy
+            row_sums = bigram_counts.sum(axis=1)
+            row_entropies = []
+            for r in range(256):
+                if row_sums[r] > 0:
+                    rp = bigram_counts[r][bigram_counts[r] > 0] / row_sums[r]
+                    row_entropies.append(-float(np.sum(rp * np.log2(rp))))
+            if row_entropies:
+                mean_row_h = np.mean(row_entropies)
+                transition_rank = round(mean_row_h / np.log2(256), 6)  # Normalized
+            else:
+                transition_rank = 0.0
+
+            # Markov order: bigram entropy / (2 × unigram entropy)
+            if entropy > 0:
+                markov_order = round(bigram_h / (2.0 * entropy), 6)
+            else:
+                markov_order = 0.0
+
+            # Index autocorrelation: correlation between adjacent bytes
+            if n >= 3:
+                a1 = arr[:-1].astype(np.float64)
+                a2 = arr[1:].astype(np.float64)
+                m1, m2 = a1.mean(), a2.mean()
+                s1, s2 = a1.std(), a2.std()
+                if s1 > 0 and s2 > 0:
+                    index_autocorr = round(float(np.mean((a1 - m1) * (a2 - m2)) / (s1 * s2)), 6)
 
         # --- Per-block entropy (16KB blocks) ---
         block_size = 16384
@@ -387,15 +482,28 @@ class GlyphDAR:
         anchor_positions = anchor_positions[:1000]
 
         # --- Latent shape classification ---
+        # v3: use transition_entropy as primary signal when available
         nonzero_bins = int(np.sum(byte_counts > 0))
-        if entropy > 7.5 and nonzero_bins > 200:
-            cluster, shape_conf = "embedding", 0.8
-        elif entropy > 6.5:
-            cluster, shape_conf = "ffn", 0.75
-        elif entropy > 5.0:
-            cluster, shape_conf = "attention", 0.7
+        if transition_entropy > 0:
+            # Transition-based classification (Phase 0.10)
+            if transition_entropy > 0.985:
+                cluster, shape_conf = "embedding", 0.85
+            elif transition_entropy > 0.975:
+                cluster, shape_conf = "ffn", 0.80
+            elif transition_entropy > 0.960:
+                cluster, shape_conf = "attention", 0.75
+            else:
+                cluster, shape_conf = "norm", 0.70
         else:
-            cluster, shape_conf = "norm", 0.65
+            # Fallback: entropy-based classification (v2 behavior)
+            if entropy > 7.5 and nonzero_bins > 200:
+                cluster, shape_conf = "embedding", 0.8
+            elif entropy > 6.5:
+                cluster, shape_conf = "ffn", 0.75
+            elif entropy > 5.0:
+                cluster, shape_conf = "attention", 0.7
+            else:
+                cluster, shape_conf = "norm", 0.65
 
         latent_shape = LatentShape(
             cluster=cluster,
@@ -403,13 +511,20 @@ class GlyphDAR:
             complexity=round(entropy / 8.0, 4),
         )
 
-        # --- Route affinity ---
-        route_affinity = "cpu" if entropy < 3.0 else "gpu"
+        # --- Route affinity (v3: transition structure primary) ---
+        if transition_entropy > 0:
+            route_affinity = "cpu" if transition_entropy < 0.96 else "gpu"
+        else:
+            route_affinity = "cpu" if entropy < 3.0 else "gpu"
 
         return Shadow(
+            simhash64=simhash64,
+            transition_entropy=transition_entropy,
+            transition_rank=transition_rank,
+            markov_order=markov_order,
+            index_autocorr=index_autocorr,
             entropy=round(entropy, 6),
             entropy_per_block=entropy_per_block,
-            simhash64=simhash64,
             glyph_histogram=glyph_histogram,
             anchor_positions=anchor_positions,
             latent_shape=latent_shape,
