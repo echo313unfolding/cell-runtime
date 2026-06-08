@@ -436,6 +436,281 @@ class GlyphDAR:
         return shadow, ghost
 
 
+# ---------------------------------------------------------------------------
+# Shadow Memory — the fourth plane
+# ---------------------------------------------------------------------------
+# Shadow = measured. Ghost = inferred. Memory = learned.
+#
+# RF localization doesn't build a map from one reflection. It builds a map
+# from reflection + reflection + reflection over time.
+#
+# Shadow Memory stores (shadow, ghost, outcome) tuples. When a new Shadow
+# arrives, nearest-neighbor lookup finds historical Shadows by SimHash
+# Hamming distance. Historical Ghosts vote on the new prediction.
+#
+# Key question: "Can two different bodies produce similar shadows?"
+# If yes → nearest-neighbor lookup → prior Ghosts → faster inference.
+# "I've seen this pattern before" without opening the body.
+# ---------------------------------------------------------------------------
+
+
+def _hamming64(a: int, b: int) -> int:
+    """Hamming distance between two 64-bit SimHash values.
+
+    O(1) per comparison. This is the nearest-neighbor metric for shadows.
+    Low distance = structurally similar encoded regions.
+    """
+    return bin(a ^ b).count("1")
+
+
+@dataclass
+class Outcome:
+    """What actually happened when a Ghost's prediction was tested.
+
+    The receipt from execution, fed back into Memory so future Ghosts
+    can learn from past experience.
+    """
+    actual_route: str = ""               # Where it actually ran (cpu/gpu/qpu)
+    actual_time_ms: float = 0.0          # How long it took
+    actual_memory_mb: float = 0.0        # How much memory it used
+    success: bool = True                 # Did it work?
+    execution_level: int = 2             # 0-4 on the ladder
+    receipt_hash: str = ""               # SHA256 of the full receipt
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "actual_route": self.actual_route,
+            "actual_time_ms": self.actual_time_ms,
+            "actual_memory_mb": self.actual_memory_mb,
+            "success": self.success,
+            "execution_level": self.execution_level,
+            "receipt_hash": self.receipt_hash,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Outcome":
+        if d is None:
+            return cls()
+        return cls(
+            actual_route=d.get("actual_route", ""),
+            actual_time_ms=d.get("actual_time_ms", 0.0),
+            actual_memory_mb=d.get("actual_memory_mb", 0.0),
+            success=d.get("success", True),
+            execution_level=d.get("execution_level", 2),
+            receipt_hash=d.get("receipt_hash", ""),
+            timestamp=d.get("timestamp", ""),
+        )
+
+
+@dataclass
+class MemoryEntry:
+    """One observation in Shadow Memory: shadow + ghost + what actually happened."""
+    shadow: Shadow
+    ghost: Ghost
+    outcome: Optional[Outcome] = None    # None if not yet executed
+    shard_id: str = ""
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "shadow": self.shadow.to_dict(),
+            "ghost": self.ghost.to_dict(),
+            "outcome": self.outcome.to_dict() if self.outcome else None,
+            "shard_id": self.shard_id,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MemoryEntry":
+        return cls(
+            shadow=Shadow.from_dict(d["shadow"]),
+            ghost=Ghost.from_dict(d["ghost"]),
+            outcome=Outcome.from_dict(d["outcome"]) if d.get("outcome") else None,
+            shard_id=d.get("shard_id", ""),
+            timestamp=d.get("timestamp", ""),
+        )
+
+
+class ShadowMemory:
+    """Nearest-neighbor index of Shadows with historical Ghost outcomes.
+
+    The fourth plane: Shadow = measured, Ghost = inferred, Memory = learned.
+
+    Stores (Shadow, Ghost, Outcome) tuples. When a new Shadow arrives,
+    finds nearest historical Shadows by SimHash64 Hamming distance.
+    Historical Ghosts + Outcomes vote on the new prediction.
+
+    RF analogy: one reflection = uncertain. Many reflections = map.
+    ShadowMemory is the map.
+
+    Usage:
+        mem = ShadowMemory()
+
+        # Record observations
+        mem.remember(shadow, ghost, outcome, shard_id="blk.0")
+
+        # Query: "have I seen something like this before?"
+        neighbors = mem.recall(new_shadow, k=5)
+
+        # Consensus: historical observations vote on new prediction
+        consensus = mem.consensus_ghost(new_shadow, k=5)
+    """
+
+    def __init__(self):
+        self._entries: list[MemoryEntry] = []
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def remember(self, shadow: Shadow, ghost: Ghost,
+                 outcome: Optional[Outcome] = None, shard_id: str = ""):
+        """Store an observation: shadow + ghost + what actually happened."""
+        entry = MemoryEntry(
+            shadow=shadow,
+            ghost=ghost,
+            outcome=outcome,
+            shard_id=shard_id,
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        self._entries.append(entry)
+
+    def recall(self, query_shadow: Shadow, k: int = 5) -> list[tuple[MemoryEntry, int]]:
+        """Find k nearest historical Shadows by SimHash64 Hamming distance.
+
+        Returns: list of (entry, hamming_distance) sorted by distance.
+        Distance 0 = identical structural fingerprint.
+        Distance 32 = uncorrelated (random).
+        Distance 64 = anti-correlated.
+        """
+        if not self._entries:
+            return []
+
+        scored = []
+        for entry in self._entries:
+            dist = _hamming64(query_shadow.simhash64, entry.shadow.simhash64)
+            scored.append((entry, dist))
+
+        scored.sort(key=lambda x: x[1])
+        return scored[:k]
+
+    def consensus_ghost(self, query_shadow: Shadow, k: int = 5) -> Optional[Ghost]:
+        """Build a Ghost from nearest historical observations.
+
+        Historical Ghosts vote on class, route, memory. Weighted by
+        inverse Hamming distance. Outcomes (if available) adjust confidence.
+
+        Returns None if memory is empty.
+        """
+        neighbors = self.recall(query_shadow, k=k)
+        if not neighbors:
+            return None
+
+        # Vote on shard_class (weighted by inverse distance)
+        class_votes: dict[str, float] = {}
+        route_votes: dict[str, float] = {}
+        memory_sum = 0.0
+        weight_sum = 0.0
+        confidence_sum = 0.0
+
+        for entry, dist in neighbors:
+            # Weight: inverse of distance. Distance 0 → weight 64, distance 32 → weight 32.
+            w = 64.0 - dist
+            if w <= 0:
+                w = 0.1  # Floor for anti-correlated neighbors
+
+            g = entry.ghost
+
+            # Class vote
+            if g.shard_class:
+                class_votes[g.shard_class] = class_votes.get(g.shard_class, 0.0) + w
+
+            # Route vote: prefer outcome.actual_route if available
+            route = g.predicted_route
+            if entry.outcome and entry.outcome.actual_route:
+                route = entry.outcome.actual_route
+            if route:
+                route_votes[route] = route_votes.get(route, 0.0) + w
+
+            # Memory estimate
+            if entry.outcome and entry.outcome.actual_memory_mb > 0:
+                memory_sum += entry.outcome.actual_memory_mb * w
+            else:
+                memory_sum += g.predicted_memory_mb * w
+
+            # Confidence: higher if outcomes exist and were successful
+            if entry.outcome and entry.outcome.success:
+                confidence_sum += w * 1.0
+            elif entry.outcome and not entry.outcome.success:
+                confidence_sum += w * 0.3
+            else:
+                confidence_sum += w * g.confidence
+
+            weight_sum += w
+
+        if weight_sum == 0:
+            return None
+
+        # Winner-take-all for class and route
+        best_class = max(class_votes, key=class_votes.get) if class_votes else ""
+        best_route = max(route_votes, key=route_votes.get) if route_votes else ""
+
+        return Ghost(
+            shard_class=best_class,
+            predicted_route=best_route,
+            predicted_memory_mb=round(memory_sum / weight_sum, 2),
+            confidence=round(confidence_sum / weight_sum, 3),
+            source_simhash64=query_shadow.simhash64,
+        )
+
+    def record_outcome(self, simhash64: int, outcome: Outcome):
+        """Attach an execution outcome to the most recent matching entry."""
+        for entry in reversed(self._entries):
+            if entry.shadow.simhash64 == simhash64 and entry.outcome is None:
+                entry.outcome = outcome
+                return True
+        return False
+
+    def stats(self) -> dict:
+        """Summary statistics of the memory."""
+        n = len(self._entries)
+        if n == 0:
+            return {"entries": 0}
+
+        classes = {}
+        routes = {}
+        with_outcomes = 0
+        for e in self._entries:
+            c = e.ghost.shard_class
+            if c:
+                classes[c] = classes.get(c, 0) + 1
+            r = e.ghost.predicted_route
+            if r:
+                routes[r] = routes.get(r, 0) + 1
+            if e.outcome:
+                with_outcomes += 1
+
+        return {
+            "entries": n,
+            "with_outcomes": with_outcomes,
+            "classes": classes,
+            "routes": routes,
+        }
+
+    def save(self, path: str):
+        """Persist memory to JSON."""
+        data = [e.to_dict() for e in self._entries]
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def load(self, path: str):
+        """Load memory from JSON."""
+        with open(path) as f:
+            data = json.load(f)
+        self._entries = [MemoryEntry.from_dict(d) for d in data]
+
+
 class Intent(Enum):
     """What the packet WANTS. Makes the packet active, not passive.
 

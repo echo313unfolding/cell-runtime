@@ -32,8 +32,12 @@ from cell.vault_shard import (
     GlyphPacket,
     Intent,
     LatentShape,
+    MemoryEntry,
     Opcode,
+    Outcome,
     Shadow,
+    ShadowMemory,
+    _hamming64,
 )
 
 
@@ -540,3 +544,330 @@ class TestGlyphDAR:
         assert manual.entropy == auto.entropy
         assert manual.simhash64 == auto.simhash64
         assert manual.latent_shape.cluster == auto.latent_shape.cluster
+
+
+# ---------------------------------------------------------------------------
+# Shadow Memory — real-data tests
+# ---------------------------------------------------------------------------
+
+class TestHammingDistance:
+    """SimHash64 Hamming distance is the nearest-neighbor metric."""
+
+    def test_identical_shadows_distance_zero(self):
+        assert _hamming64(0xDEADBEEFCAFEBABE, 0xDEADBEEFCAFEBABE) == 0
+
+    def test_one_bit_flip(self):
+        assert _hamming64(0x0000000000000000, 0x0000000000000001) == 1
+
+    def test_all_bits_different(self):
+        assert _hamming64(0x0000000000000000, 0xFFFFFFFFFFFFFFFF) == 64
+
+    def test_half_bits(self):
+        assert _hamming64(0x00000000FFFFFFFF, 0xFFFFFFFF00000000) == 64
+
+    def test_real_shadows_distance(self, cdna_header):
+        """Hamming distance between real shadows from different regions."""
+        offset = cdna_header["latent_offset"]
+        s1 = GlyphDAR.scan_file(str(CDNA_PATH), offset=offset, window_size=256*1024)
+        s2 = GlyphDAR.scan_file(str(CDNA_PATH), offset=offset + 10*1024*1024, window_size=256*1024)
+        dist = _hamming64(s1.simhash64, s2.simhash64)
+        print(f"\nHamming distance between offset 0 and offset 10MB: {dist}/64")
+        # Should be nonzero (different regions) but not 64 (same file, some structure shared)
+        assert 0 < dist < 64
+
+
+class TestShadowMemoryUnit:
+    """Unit tests for ShadowMemory (no real data required)."""
+
+    def test_empty_memory(self):
+        mem = ShadowMemory()
+        assert len(mem) == 0
+        assert mem.recall(Shadow()) == []
+        assert mem.consensus_ghost(Shadow()) is None
+
+    def test_remember_and_recall(self):
+        mem = ShadowMemory()
+        s = Shadow(entropy=4.0, simhash64=0xAAAA)
+        g = Ghost(shard_class="attention", predicted_route="gpu", confidence=0.8)
+        mem.remember(s, g, shard_id="blk.0")
+
+        neighbors = mem.recall(Shadow(simhash64=0xAAAA), k=1)
+        assert len(neighbors) == 1
+        entry, dist = neighbors[0]
+        assert dist == 0  # Exact match
+        assert entry.ghost.shard_class == "attention"
+
+    def test_recall_sorts_by_distance(self):
+        mem = ShadowMemory()
+        # Insert three entries with known simhashes
+        for sim, cls in [(0b0000, "norm"), (0b0001, "attention"), (0b1111, "ffn")]:
+            mem.remember(
+                Shadow(simhash64=sim),
+                Ghost(shard_class=cls),
+            )
+        # Query with 0b0000 — nearest should be 0b0000 (dist=0), then 0b0001 (dist=1)
+        neighbors = mem.recall(Shadow(simhash64=0b0000), k=3)
+        assert neighbors[0][1] == 0  # exact match
+        assert neighbors[1][1] == 1  # one bit flip
+        assert neighbors[2][1] == 4  # 0b1111 vs 0b0000 = 4 bits
+
+    def test_consensus_ghost_basic(self):
+        mem = ShadowMemory()
+        # 3 observations all say "attention" + "gpu"
+        for i in range(3):
+            mem.remember(
+                Shadow(simhash64=0xAAAA + i),
+                Ghost(shard_class="attention", predicted_route="gpu", confidence=0.8),
+            )
+        # 1 observation says "ffn" + "cpu"
+        mem.remember(
+            Shadow(simhash64=0xFFFF),
+            Ghost(shard_class="ffn", predicted_route="cpu", confidence=0.6),
+        )
+
+        consensus = mem.consensus_ghost(Shadow(simhash64=0xAAAA), k=4)
+        assert consensus is not None
+        # Nearest neighbors are the 3 attention entries → should win vote
+        assert consensus.shard_class == "attention"
+        assert consensus.predicted_route == "gpu"
+
+    def test_outcome_improves_confidence(self):
+        mem = ShadowMemory()
+        s = Shadow(simhash64=0xBBBB)
+        g = Ghost(shard_class="ffn", predicted_route="gpu", confidence=0.5)
+        mem.remember(s, g, shard_id="blk.1")
+
+        # Record successful outcome
+        mem.record_outcome(0xBBBB, Outcome(
+            actual_route="gpu", actual_time_ms=5.0, success=True
+        ))
+
+        # Consensus should have higher confidence (success amplifies weight)
+        consensus = mem.consensus_ghost(Shadow(simhash64=0xBBBB), k=1)
+        assert consensus is not None
+        assert consensus.confidence > 0.5  # Boosted by successful outcome
+
+    def test_outcome_actual_route_overrides_predicted(self):
+        mem = ShadowMemory()
+        # Ghost predicted CPU, but outcome shows GPU worked better
+        mem.remember(
+            Shadow(simhash64=0xCCCC),
+            Ghost(shard_class="attention", predicted_route="cpu", confidence=0.6),
+            outcome=Outcome(actual_route="gpu", success=True),
+        )
+        consensus = mem.consensus_ghost(Shadow(simhash64=0xCCCC), k=1)
+        assert consensus.predicted_route == "gpu"  # Outcome wins over prediction
+
+    def test_stats(self):
+        mem = ShadowMemory()
+        mem.remember(Shadow(), Ghost(shard_class="attention", predicted_route="gpu"))
+        mem.remember(Shadow(), Ghost(shard_class="ffn", predicted_route="gpu"),
+                     outcome=Outcome(actual_route="gpu", success=True))
+        s = mem.stats()
+        assert s["entries"] == 2
+        assert s["with_outcomes"] == 1
+        assert s["classes"]["attention"] == 1
+        assert s["classes"]["ffn"] == 1
+
+    def test_save_and_load(self, tmp_path):
+        mem = ShadowMemory()
+        mem.remember(
+            Shadow(entropy=4.0, simhash64=99, latent_shape=LatentShape(cluster="ffn")),
+            Ghost(shard_class="ffn", predicted_route="gpu", confidence=0.7),
+            outcome=Outcome(actual_route="gpu", actual_time_ms=3.2, success=True),
+            shard_id="blk.5",
+        )
+        path = str(tmp_path / "shadow_memory.json")
+        mem.save(path)
+
+        mem2 = ShadowMemory()
+        mem2.load(path)
+        assert len(mem2) == 1
+        neighbors = mem2.recall(Shadow(simhash64=99), k=1)
+        assert neighbors[0][0].ghost.shard_class == "ffn"
+        assert neighbors[0][0].outcome.actual_time_ms == 3.2
+
+
+class TestShadowMemoryRealData:
+    """Shadow Memory on real CDNA data — answers the advisor's key questions."""
+
+    @pytest.fixture(scope="class")
+    def populated_memory(self, cdna_header):
+        """Scan multiple windows of the real CDNA file and populate memory."""
+        mem = ShadowMemory()
+        offset = cdna_header["latent_offset"]
+        window_size = 256 * 1024  # 256KB
+
+        # Scan 20 windows across the file
+        for i in range(20):
+            raw = read_raw_index_window(
+                CDNA_PATH, offset + i * window_size, window_size
+            )
+            if len(raw) < window_size:
+                break
+            shadow = GlyphDAR.scan(raw, codec="cdna_v1_vq256")
+            ghost = Ghost.from_shadow(shadow, shard_id=f"window_{i}")
+
+            # Simulate outcomes for even-numbered windows
+            outcome = None
+            if i % 2 == 0:
+                outcome = Outcome(
+                    actual_route=ghost.predicted_route,
+                    actual_time_ms=1.0 + i * 0.5,
+                    actual_memory_mb=ghost.predicted_memory_mb,
+                    success=True,
+                )
+
+            mem.remember(shadow, ghost, outcome=outcome, shard_id=f"window_{i}")
+
+        return mem
+
+    def test_memory_populated(self, populated_memory):
+        assert len(populated_memory) >= 10
+        s = populated_memory.stats()
+        print(f"\nMemory stats: {json.dumps(s, indent=2)}")
+        assert s["with_outcomes"] > 0
+
+    def test_can_similar_shadows_exist(self, populated_memory):
+        """KEY QUESTION: Can two different regions produce similar shadows?
+
+        If yes → nearest-neighbor lookup works → prior Ghosts reusable.
+        "I've seen this pattern before" without opening the body.
+        """
+        entries = populated_memory._entries
+        similar_pairs = []
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                dist = _hamming64(
+                    entries[i].shadow.simhash64,
+                    entries[j].shadow.simhash64,
+                )
+                if dist <= 8:  # Within 8 bit flips = structurally similar
+                    similar_pairs.append((i, j, dist))
+
+        print(f"\nSimilar shadow pairs (Hamming <= 8): {len(similar_pairs)}")
+        for i, j, d in similar_pairs[:10]:
+            print(f"  window_{i} <-> window_{j}: "
+                  f"Hamming={d}, "
+                  f"entropy=({entries[i].shadow.entropy:.2f}, {entries[j].shadow.entropy:.2f}), "
+                  f"class=({entries[i].ghost.shard_class}, {entries[j].ghost.shard_class})")
+
+        # This is a discovery test — we report what we find.
+        # The hypothesis: similar shadows should have similar ghosts.
+        if similar_pairs:
+            same_class = sum(
+                1 for i, j, _ in similar_pairs
+                if entries[i].ghost.shard_class == entries[j].ghost.shard_class
+            )
+            print(f"\n  Same class in similar pairs: {same_class}/{len(similar_pairs)}")
+            # If shadows are meaningful, similar shadows → same class most of the time
+            if len(similar_pairs) >= 3:
+                assert same_class / len(similar_pairs) >= 0.5, \
+                    "Similar shadows should predict similar classes"
+
+    def test_consensus_ghost_on_new_window(self, populated_memory, cdna_header):
+        """Query memory with a NEW window and see if consensus improves prediction."""
+        offset = cdna_header["latent_offset"]
+        # Scan a window NOT in memory (offset 25)
+        new_raw = read_raw_index_window(
+            CDNA_PATH, offset + 25 * 256 * 1024, 256 * 1024
+        )
+        if len(new_raw) < 256 * 1024:
+            pytest.skip("CDNA file too small")
+
+        new_shadow = GlyphDAR.scan(new_raw, codec="cdna_v1_vq256")
+
+        # Single Ghost (stateless)
+        single_ghost = Ghost.from_shadow(new_shadow)
+
+        # Consensus Ghost (memory-informed)
+        consensus = populated_memory.consensus_ghost(new_shadow, k=5)
+
+        assert consensus is not None
+        print(f"\nNew window shadow: entropy={new_shadow.entropy:.2f}, "
+              f"simhash={hex(new_shadow.simhash64)}")
+        print(f"Single Ghost:    class={single_ghost.shard_class}, "
+              f"route={single_ghost.predicted_route}, "
+              f"conf={single_ghost.confidence}")
+        print(f"Consensus Ghost: class={consensus.shard_class}, "
+              f"route={consensus.predicted_route}, "
+              f"conf={consensus.confidence}")
+
+        # Consensus should have confidence (it has historical data to draw on)
+        assert consensus.confidence > 0
+
+        # Report nearest neighbors
+        neighbors = populated_memory.recall(new_shadow, k=5)
+        print(f"\nNearest neighbors:")
+        for entry, dist in neighbors:
+            outcome_str = ""
+            if entry.outcome:
+                outcome_str = f" [outcome: {entry.outcome.actual_route}, {entry.outcome.actual_time_ms:.1f}ms]"
+            print(f"  {entry.shard_id}: Hamming={dist}, "
+                  f"class={entry.ghost.shard_class}, "
+                  f"route={entry.ghost.predicted_route}"
+                  f"{outcome_str}")
+
+    def test_memory_persistence_roundtrip(self, populated_memory, tmp_path):
+        """Memory survives save/load cycle."""
+        path = str(tmp_path / "shadow_memory.json")
+        populated_memory.save(path)
+
+        mem2 = ShadowMemory()
+        mem2.load(path)
+        assert len(mem2) == len(populated_memory)
+
+        # Stats should match
+        s1 = populated_memory.stats()
+        s2 = mem2.stats()
+        assert s1["entries"] == s2["entries"]
+        assert s1["with_outcomes"] == s2["with_outcomes"]
+
+    def test_hamming_distance_distribution(self, populated_memory):
+        """Map the Hamming distance distribution across all shadow pairs.
+
+        This tells us whether the shadow space has structure or is noise.
+        Structured: clustered distances (many near 0 or near some value).
+        Noise: uniform distribution around 32 (expected for random 64-bit values).
+        """
+        entries = populated_memory._entries
+        distances = []
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                d = _hamming64(entries[i].shadow.simhash64, entries[j].shadow.simhash64)
+                distances.append(d)
+
+        if not distances:
+            pytest.skip("Not enough entries")
+
+        mean_dist = sum(distances) / len(distances)
+        min_dist = min(distances)
+        max_dist = max(distances)
+
+        # Bucket into ranges
+        buckets = {"0-8": 0, "9-16": 0, "17-24": 0, "25-32": 0, "33-48": 0, "49-64": 0}
+        for d in distances:
+            if d <= 8:
+                buckets["0-8"] += 1
+            elif d <= 16:
+                buckets["9-16"] += 1
+            elif d <= 24:
+                buckets["17-24"] += 1
+            elif d <= 32:
+                buckets["25-32"] += 1
+            elif d <= 48:
+                buckets["33-48"] += 1
+            else:
+                buckets["49-64"] += 1
+
+        print(f"\nHamming distance distribution ({len(distances)} pairs):")
+        print(f"  Mean: {mean_dist:.1f}, Min: {min_dist}, Max: {max_dist}")
+        for bucket, count in buckets.items():
+            bar = "#" * (count * 40 // max(max(buckets.values()), 1))
+            print(f"  {bucket:>5}: {count:3d} {bar}")
+
+        # Key insight: if mean distance is significantly below 32,
+        # the shadow space has structure (not random noise)
+        print(f"\n  Mean vs random expectation (32): "
+              f"{'STRUCTURED' if mean_dist < 28 else 'NEAR-RANDOM'} "
+              f"(mean={mean_dist:.1f})")
