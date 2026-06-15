@@ -1,11 +1,12 @@
-# A data pipeline — Level 4 (external)
+# Data pipeline — Level 4 (external)
 name data_pipeline
 
-seed source with "sensor_feed"
-grow readings with source
-when readings > 0:
-    emit "readings" readings
-    pack readings as csv
-    lift readings to archive
-use cleanup(target: readings)
-bloom "pipeline done"
+seed readings with [72, 68, 75, 71, 69]
+seed threshold with 70
+for each val in readings:
+    when val > threshold:
+        emit "above" val
+pack readings as json
+lift readings_json to "readings.json"
+emit "pipeline complete"
+bloom "done"

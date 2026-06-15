@@ -1,6 +1,6 @@
-"""Ballad — JavaScript emitter. Event-driven, flowing, async."""
+"""Ballad — JavaScript emitter. Produces runnable JS."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from poetica.emitters.base import BaseEmitter
 
 
@@ -17,22 +17,38 @@ class JavaScriptEmitter(BaseEmitter):
         safe = name.replace(':', '_').replace('-', '_').replace('.', '_')
         return [f"}}", f"", f"{safe}();"]
 
+    def _fn_preamble(self, ir) -> List[str]:
+        lines = []
+        ops = {op["op"] for op in ir.get("ops", [])}
+        if "remember" in ops:
+            lines.append("const _state = {};")
+        if "learn" in ops:
+            lines.append("const _patterns = {};")
+        return lines
+
+    def _block_close(self, block_type: str) -> Optional[str]:
+        return "}"
+
     def _op_seed(self, op: Dict[str, Any]) -> str:
-        return f"const {op['name']} = {self._quote(op['value'])};"
+        return f"let {op['name']} = {self._quote(op['value'])};"
 
     def _op_grow(self, op: Dict[str, Any]) -> str:
-        return f"const {op['name']} = build({self._quote(op['source'])});"
+        return f"{op['name']}.push({self._quote(op['source'])});"
 
     def _op_emit(self, op: Dict[str, Any]) -> str:
         if op.get('label'):
-            return f'console.log(`[{op["label"]}] ${{{self._quote(op["value"])}}}`);\n'
+            return f'console.log(`[{op["label"]}] ${{{op["value"]}}}`);'
         return f"console.log({self._quote(op['value'])});"
 
     def _op_pack(self, op: Dict[str, Any]) -> str:
-        return f"const {op['format']}Packed = compress({op['data']}, {self._quote(op['format'])});"
+        fmt = op['format']
+        data = op['data']
+        if fmt == 'json':
+            return f"const {data}_json = JSON.stringify({data});"
+        return f"const {data}_{fmt} = String({data});"
 
     def _op_lift(self, op: Dict[str, Any]) -> str:
-        return f"await deploy({op['name']}, {self._quote(op['dest'])});"
+        return f'require("fs").writeFileSync({self._quote(op["dest"])}, String({op["name"]}));'
 
     def _op_use(self, op: Dict[str, Any]) -> str:
         params = ", ".join(f"{k}: {self._quote(str(v))}" for k, v in op.get('params', {}).items())
@@ -49,6 +65,12 @@ class JavaScriptEmitter(BaseEmitter):
     def _op_if(self, op: Dict[str, Any]) -> str:
         return f"if ({op['left']} === {op['right']}) {{"
 
+    def _op_else_when(self, op: Dict[str, Any]) -> str:
+        return f"}} else if ({op['condition']}) {{"
+
+    def _op_else(self, op: Dict[str, Any]) -> str:
+        return "} else {"
+
     def _op_flow(self, op: Dict[str, Any]) -> str:
         return f"let {op['dest']} = {op['source']};"
 
@@ -56,14 +78,10 @@ class JavaScriptEmitter(BaseEmitter):
         return f"return {self._quote(op['value'])};"
 
     def _op_remember(self, op: Dict[str, Any]) -> str:
-        return f"state[{self._quote(op['key'])}] = {self._quote(op['value'])};"
+        return f'_state["{op["key"]}"] = {self._quote(op["value"])};'
 
     def _op_learn(self, op: Dict[str, Any]) -> str:
-        return f'model.fit({{ pattern: {self._quote(op["pattern"])} }});'
+        return f'_patterns["{op["pattern"]}"] = new RegExp("{op["pattern"]}");'
 
     def _op_for(self, op: Dict[str, Any]) -> str:
-        lines = [f"for (const {op['var']} of {op['collection']}) {{"]
-        if op.get('body'):
-            lines.append(f"  {op['body']};")
-        lines.append("}")
-        return lines
+        return f"for (const {op['var']} of {op['collection']}) {{"

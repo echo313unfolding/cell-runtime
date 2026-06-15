@@ -1,14 +1,15 @@
-"""Base emitter interface."""
+"""Base emitter with block tracking."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 class BaseEmitter:
-    """Base class for all Poetica emitters."""
-
     INDENT = "    "
     COMMENT = "#"
     LANG = "unknown"
+
+    _BLOCK_OPENERS = {"when", "when_in", "if"}
+    _BLOCK_CONTINUATIONS = {"else_when", "else"}
 
     def emit(self, ir: Dict[str, Any]) -> str:
         lines = []
@@ -19,15 +20,56 @@ class BaseEmitter:
         name = ir.get("name", "program")
         lines.extend(self._fn_open(name))
 
-        for op in ir.get("ops", []):
+        preamble = self._fn_preamble(ir)
+        if preamble:
+            for line in preamble:
+                lines.append(f"{self.INDENT}{line}")
+
+        block_stack = []  # [(indent, op_type)]
+        ops = ir.get("ops", [])
+
+        for op in ops:
+            op_indent = op.get("indent", 0)
+
+            # Close blocks when indent decreases
+            while block_stack and op_indent <= block_stack[-1][0]:
+                if (op["op"] in self._BLOCK_CONTINUATIONS
+                        and op_indent == block_stack[-1][0]):
+                    # Continuation (else/elif) — skip standard close
+                    block_stack.pop()
+                    break
+                closed_indent, closed_type = block_stack.pop()
+                close = self._block_close(closed_type)
+                if close:
+                    lines.append(f"{self.INDENT * (closed_indent + 1)}{close}")
+
+            # Emit the op
             code = self._emit_op(op)
             if code is not None:
-                indent = self.INDENT * (op.get("indent", 0) + 1)
-                for line in code if isinstance(code, list) else [code]:
-                    lines.append(f"{indent}{line}")
+                base = self.INDENT * (op_indent + 1)
+                if isinstance(code, list):
+                    for line in code:
+                        lines.append(f"{base}{line}")
+                else:
+                    lines.append(f"{base}{code}")
+
+            # Track block openers
+            is_block = op["op"] in self._BLOCK_OPENERS
+            if op["op"] == "for" and not op.get("body"):
+                is_block = True
+            if op["op"] in self._BLOCK_CONTINUATIONS:
+                is_block = True
+            if is_block:
+                block_stack.append((op_indent, op["op"]))
+
+        # Close remaining open blocks
+        while block_stack:
+            closed_indent, closed_type = block_stack.pop()
+            close = self._block_close(closed_type)
+            if close:
+                lines.append(f"{self.INDENT * (closed_indent + 1)}{close}")
 
         lines.extend(self._fn_close(name))
-
         footer = self._footer(ir)
         if footer:
             lines.extend(footer)
@@ -46,6 +88,12 @@ class BaseEmitter:
     def _fn_close(self, name: str) -> List[str]:
         return []
 
+    def _fn_preamble(self, ir: Dict[str, Any]) -> List[str]:
+        return []
+
+    def _block_close(self, block_type: str) -> Optional[str]:
+        return None
+
     def _emit_op(self, op: Dict[str, Any]) -> str | List[str] | None:
         method = getattr(self, f'_op_{op["op"]}', None)
         if method:
@@ -53,8 +101,10 @@ class BaseEmitter:
         return f"{self.COMMENT} {op['op']}: {op}"
 
     def _quote(self, value: str) -> str:
-        """Smart-quote a value: keep as-is if it looks like an identifier."""
-        if value.startswith('"') or value.startswith("'"):
+        if not value:
+            return '""'
+        # Already quoted
+        if value[0] in ('"', "'"):
             return value
         # Numbers
         try:
@@ -65,7 +115,11 @@ class BaseEmitter:
         # Booleans
         if value.lower() in ('true', 'false', 'none', 'null', 'nil'):
             return value
-        # Identifiers (no spaces, starts with letter/underscore)
+        # Expressions (operators, parens, brackets)
+        if any(c in value for c in '+-*/%<>=!&|(){}[],^~'):
+            return value
+        # Identifiers (variable.field, _private, etc)
         if value.replace('.', '').replace('_', '').isalnum() and not value[0].isdigit():
             return value
+        # Default: quote as string
         return f'"{value}"'

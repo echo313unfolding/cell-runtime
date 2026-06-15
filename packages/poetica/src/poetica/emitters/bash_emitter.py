@@ -1,6 +1,6 @@
 """Prose — Bash emitter. Imperative, step-by-step, direct."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from poetica.emitters.base import BaseEmitter
 
 
@@ -20,22 +20,38 @@ class BashEmitter(BaseEmitter):
         safe = name.replace(':', '_').replace('-', '_').replace('.', '_')
         return [f"}}", f"", f"{safe}"]
 
+    def _fn_preamble(self, ir) -> List[str]:
+        lines = []
+        ops = {op["op"] for op in ir.get("ops", [])}
+        if "remember" in ops:
+            lines.append("declare -A _state")
+        return lines
+
+    def _block_close(self, block_type: str) -> Optional[str]:
+        if block_type == "for":
+            return "done"
+        return "fi"
+
     def _op_seed(self, op: Dict[str, Any]) -> str:
         return f'{op["name"]}={self._quote(op["value"])}'
 
     def _op_grow(self, op: Dict[str, Any]) -> str:
-        return f'{op["name"]}=$(build {self._quote(op["source"])})'
+        return f'{op["name"]}+=({self._quote(op["source"])})'
 
     def _op_emit(self, op: Dict[str, Any]) -> str:
         if op.get('label'):
             return f'echo "[{op["label"]}] ${{{op["value"]}}}"'
-        return f"echo {self._quote(op['value'])}"
+        return f'echo "${{{op["value"]}}}"'
 
     def _op_pack(self, op: Dict[str, Any]) -> str:
-        return f'tar czf {op["format"]}.tar.gz {op["data"]}'
+        fmt = op['format']
+        data = op['data']
+        if fmt == 'json':
+            return f'{data}_json=$(printf \'%s\\n\' "${{{data}[@]}}" | jq -R . | jq -s .)'
+        return f'{data}_{fmt}="${{{data}[@]}}"'
 
     def _op_lift(self, op: Dict[str, Any]) -> str:
-        return f'scp {op["name"]} {op["dest"]}'
+        return f'echo "${{{op["name"]}}}" > {self._quote(op["dest"])}'
 
     def _op_use(self, op: Dict[str, Any]) -> str:
         params = " ".join(f"--{k} {self._quote(str(v))}" for k, v in op.get('params', {}).items())
@@ -45,26 +61,28 @@ class BashEmitter(BaseEmitter):
         return f'if [[ {op["condition"]} ]]; then'
 
     def _op_when_in(self, op: Dict[str, Any]) -> str:
-        return f'if echo "{op["container"]}" | grep -q "{op["subject"]}"; then'
+        return f'if echo "${{{op["container"]}}}" | grep -q "{op["subject"]}"; then'
 
     def _op_if(self, op: Dict[str, Any]) -> str:
         return f'if [[ "{op["left"]}" == "{op["right"]}" ]]; then'
 
+    def _op_else_when(self, op: Dict[str, Any]) -> str:
+        return f'elif [[ {op["condition"]} ]]; then'
+
+    def _op_else(self, op: Dict[str, Any]) -> str:
+        return "else"
+
     def _op_flow(self, op: Dict[str, Any]) -> str:
-        return f'{op["dest"]}={op["source"]}'
+        return f'{op["dest"]}=${{{op["source"]}}}'
 
     def _op_bloom(self, op: Dict[str, Any]) -> str:
         return f'echo {self._quote(op["value"])}'
 
     def _op_remember(self, op: Dict[str, Any]) -> str:
-        return f'export {op["key"]}={self._quote(op["value"])}'
+        return f'_state[{op["key"]}]={self._quote(op["value"])}'
 
     def _op_learn(self, op: Dict[str, Any]) -> str:
         return f'# learn pattern: {op["pattern"]}'
 
     def _op_for(self, op: Dict[str, Any]) -> str:
-        lines = [f'for {op["var"]} in {op["collection"]}; do']
-        if op.get('body'):
-            lines.append(f"    {op['body']}")
-        lines.append("done")
-        return lines
+        return f'for {op["var"]} in {op["collection"]}; do'

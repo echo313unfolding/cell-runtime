@@ -8,36 +8,15 @@ from typing import List, Optional
 @dataclass
 class Element:
     """A single meaningful element in a Poetica program."""
-    kind: str          # seed, grow, emit, pack, lift, use, when, flow, bloom, name, remember, text
-    content: str       # raw line content
-    indent: int = 0    # indentation level (for nesting)
-    label: str = ""    # extracted label/name
-    target: str = ""   # extracted target/destination
+    kind: str
+    content: str
+    indent: int = 0
+    label: str = ""
+    target: str = ""
     params: dict = field(default_factory=dict)
 
 
 class PoeticaParser:
-    """Parse Poetica source into a list of Elements.
-
-    Grammar verbs:
-        name <identifier>           — name this program
-        seed <thing> with <value>   — initialize / create
-        grow <thing> with <source>  — build / expand / construct
-        emit <message>              — output / print / log
-        emit "<label>" <message>    — labeled output
-        pack <data> as <format>     — compress / bundle / serialize
-        lift <thing> to <dest>      — deploy / upload / move
-        use <tool>(params)          — import / call external
-        when <cond>:                — conditional / trigger
-        when <x> in <y>:            — membership conditional
-        if <a> echoes <b>           — equality check
-        flow <source> to <dest>     — pipe / stream / assign
-        bloom <value>               — return / yield / output
-        remember <key>: <value>     — store / persist
-        learn pattern "<name>"      — train / fit / recognize
-        for each <x> in <y>: <body> — iteration
-    """
-
     PATTERNS = [
         ('name',       r'name\s+(.+)'),
         ('seed',       r'seed\s+([^\s]+)\s+with\s+(.+)'),
@@ -50,6 +29,8 @@ class PoeticaParser:
         ('when_in',    r'when\s+(.+?)\s+in\s+(.+?)\s*:'),
         ('when',       r'when\s+([^:]+?)\s*:'),
         ('if',         r'if\s+(.+?)\s+echoes?\s+(.+)'),
+        ('else_when',  r'else\s+when\s+([^:]+?)\s*:'),
+        ('else',       r'else\s*:'),
         ('flow',       r'flow\s+(.+?)\s+to\s+(.+)'),
         ('bloom',      r'bloom\s+(.+)'),
         ('remember',   r'remember\s+(\w+)\s*:\s*(.+)'),
@@ -63,11 +44,9 @@ class PoeticaParser:
             stripped = line.strip()
             if not stripped or stripped.startswith('#'):
                 continue
-
             indent = self._indent_level(line)
             element = self._match_line(stripped, indent)
             elements.append(element)
-
         return elements
 
     def _match_line(self, line: str, indent: int) -> Element:
@@ -75,37 +54,29 @@ class PoeticaParser:
             m = re.match(pattern, line)
             if m:
                 return self._build_element(kind, m, line, indent)
-
         return Element(kind='text', content=line, indent=indent)
 
     def _build_element(self, kind: str, m: re.Match, line: str, indent: int) -> Element:
         if kind == 'name':
             return Element(kind='name', content=line, indent=indent, label=m.group(1).strip())
-
         if kind == 'seed':
             return Element(kind='seed', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'grow':
             return Element(kind='grow', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'emit_label':
             return Element(kind='emit', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'emit':
             return Element(kind='emit', content=line, indent=indent,
                            target=m.group(1).strip())
-
         if kind == 'pack':
             return Element(kind='pack', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'lift':
             return Element(kind='lift', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'use':
             params = {}
             if m.group(2):
@@ -118,40 +89,36 @@ class PoeticaParser:
                         params[pair] = True
             return Element(kind='use', content=line, indent=indent,
                            label=m.group(1).strip(), params=params)
-
         if kind == 'when_in':
             return Element(kind='when_in', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'when':
             return Element(kind='when', content=line, indent=indent,
                            label=m.group(1).strip())
-
         if kind == 'if':
             return Element(kind='if', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
+        if kind == 'else_when':
+            return Element(kind='else_when', content=line, indent=indent,
+                           label=m.group(1).strip())
+        if kind == 'else':
+            return Element(kind='else', content=line, indent=indent)
         if kind == 'flow':
             return Element(kind='flow', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'bloom':
             return Element(kind='bloom', content=line, indent=indent,
                            target=m.group(1).strip())
-
         if kind == 'remember':
             return Element(kind='remember', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip())
-
         if kind == 'learn':
             return Element(kind='learn', content=line, indent=indent,
                            label=m.group(1).strip())
-
         if kind == 'for':
             return Element(kind='for', content=line, indent=indent,
                            label=m.group(1).strip(), target=m.group(2).strip(),
                            params={'body': m.group(3).strip()} if m.group(3) else {})
-
         return Element(kind='text', content=line, indent=indent)
 
     def _indent_level(self, line: str) -> int:

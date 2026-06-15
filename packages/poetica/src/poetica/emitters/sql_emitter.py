@@ -1,6 +1,6 @@
 """Verse — SQL emitter. Declarative, set-based, query-like."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from poetica.emitters.base import BaseEmitter
 
 
@@ -20,11 +20,14 @@ class SQLEmitter(BaseEmitter):
         safe = name.replace(':', '_').replace('-', '_').replace('.', '_')
         return [f"", f"-- END {safe}"]
 
+    def _block_close(self, block_type: str) -> Optional[str]:
+        return None
+
     def _op_seed(self, op: Dict[str, Any]) -> str:
         return f"SET @{op['name']} = {self._quote(op['value'])};"
 
     def _op_grow(self, op: Dict[str, Any]) -> str:
-        return f"SET @{op['name']} = (SELECT build({self._quote(op['source'])}));"
+        return f"-- grow: append {self._quote(op['source'])} to @{op['name']}"
 
     def _op_emit(self, op: Dict[str, Any]) -> str:
         if op.get('label'):
@@ -32,10 +35,12 @@ class SQLEmitter(BaseEmitter):
         return f"SELECT {self._quote(op['value'])} AS output;"
 
     def _op_pack(self, op: Dict[str, Any]) -> str:
-        return f"INSERT INTO archive (format, data) VALUES ({self._quote(op['format'])}, @{op['data']});"
+        if op['format'] == 'json':
+            return f"SELECT JSON_OBJECT('data', @{op['data']}) AS {op['data']}_json;"
+        return f"SELECT @{op['data']} AS {op['data']}_{op['format']};"
 
     def _op_lift(self, op: Dict[str, Any]) -> str:
-        return f"INSERT INTO {op['dest']} SELECT * FROM {op['name']};"
+        return f"-- lift: write @{op['name']} to {op['dest']}"
 
     def _op_use(self, op: Dict[str, Any]) -> str:
         params = ", ".join(f"{self._quote(str(v))}" for v in op.get('params', {}).values())
@@ -52,6 +57,12 @@ class SQLEmitter(BaseEmitter):
     def _op_if(self, op: Dict[str, Any]) -> str:
         return f"SELECT CASE WHEN @{op['left']} = @{op['right']} THEN 'match' ELSE 'no match' END;"
 
+    def _op_else_when(self, op: Dict[str, Any]) -> str:
+        return f"-- ELSE WHEN: {op['condition']}"
+
+    def _op_else(self, op: Dict[str, Any]) -> str:
+        return "-- ELSE:"
+
     def _op_flow(self, op: Dict[str, Any]) -> str:
         return f"SET @{op['dest']} = @{op['source']};"
 
@@ -59,13 +70,10 @@ class SQLEmitter(BaseEmitter):
         return f"SELECT {self._quote(op['value'])} AS result;"
 
     def _op_remember(self, op: Dict[str, Any]) -> str:
-        return f"INSERT INTO state (key, value) VALUES ({self._quote(op['key'])}, {self._quote(op['value'])}) ON DUPLICATE KEY UPDATE value = {self._quote(op['value'])};"
+        return f"INSERT INTO _state (key, value) VALUES ({self._quote(op['key'])}, {self._quote(op['value'])}) ON DUPLICATE KEY UPDATE value = {self._quote(op['value'])};"
 
     def _op_learn(self, op: Dict[str, Any]) -> str:
         return f"-- learn pattern: {op['pattern']}"
 
     def _op_for(self, op: Dict[str, Any]) -> str:
-        lines = [f"-- FOR EACH {op['var']} IN {op['collection']}"]
-        if op.get('body'):
-            lines.append(f"SELECT {op['body']} FROM {op['collection']};")
-        return lines
+        return f"-- FOR EACH {op['var']} IN {op['collection']}"

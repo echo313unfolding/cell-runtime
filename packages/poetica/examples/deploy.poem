@@ -3,10 +3,11 @@ name deploy_service
 
 seed version with "1.2.0"
 seed env with "production"
-grow artifact with version
-pack artifact as docker
-lift artifact to registry
-use healthcheck(url: "https://api.example.com", timeout: 30)
-emit "deploy" version
+seed artifacts with []
+grow artifacts with version
+grow artifacts with env
+pack artifacts as json
+lift artifacts_json to "build/manifest.json"
+emit "deployed" version
 remember last_deploy: version
 bloom "deployed"

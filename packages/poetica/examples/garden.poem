@@ -1,9 +1,12 @@
-# A garden simulator — Level 3 (transformation)
+# Grow a garden — Level 3 (transformation)
 name garden
 
-seed soil with "rich loam"
-seed light with "full sun"
-grow plant with soil
-emit "status" plant
-pack harvest as json
-bloom "garden complete"
+seed plants with []
+grow plants with "tomato"
+grow plants with "basil"
+grow plants with "pepper"
+for each plant in plants:
+    emit "growing" plant
+pack plants as json
+emit plants_json
+bloom "harvest complete"

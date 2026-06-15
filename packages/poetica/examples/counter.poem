@@ -1,0 +1,10 @@
+# Sum a list — Level 2 (logic)
+name counter
+
+seed items with [1, 2, 3, 4, 5]
+seed total with 0
+for each x in items:
+    emit x
+    seed total with total + x
+emit "total" total
+bloom total
