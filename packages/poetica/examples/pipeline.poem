@@ -1,0 +1,11 @@
+# A data pipeline — Level 4 (external)
+name data_pipeline
+
+seed source with "sensor_feed"
+grow readings with source
+when readings > 0:
+    emit "readings" readings
+    pack readings as csv
+    lift readings to archive
+use cleanup(target: readings)
+bloom "pipeline done"

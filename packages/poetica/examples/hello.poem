@@ -1,0 +1,7 @@
+# A simple greeter — Level 1 (pure)
+name greeter
+
+seed message with "hello world"
+seed count with 1
+emit message
+bloom "done"

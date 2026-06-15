@@ -1,0 +1,11 @@
+# FizzBuzz — Level 2 (logic)
+name fizzbuzz
+
+seed limit with 100
+for each n in range:
+    when n % 15 echoes 0:
+        emit "FizzBuzz"
+    when n % 3 echoes 0:
+        emit "Fizz"
+    when n % 5 echoes 0:
+        emit "Buzz"

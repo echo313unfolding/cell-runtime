@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poetica"
+version = "0.1.0"
+description = "Write what you mean. Poetica compiles human-readable programs into real code, gated by capability level."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+keywords = ["dsl", "compiler", "code-generation", "accessibility", "polyglot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Compilers",
+    "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+poetica = "poetica.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,9 @@
+# A garden simulator — Level 3 (transformation)
+name garden
+
+seed soil with "rich loam"
+seed light with "full sun"
+grow plant with soil
+emit "status" plant
+pack harvest as json
+bloom "garden complete"
