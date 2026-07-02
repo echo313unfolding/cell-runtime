@@ -7,7 +7,7 @@ The language-surface layer (`compiler.py`, `parser.py`, emitters, `gate.py`)
 is shipped and working. This roadmap covers the **codegen plan-IR sub-project**:
 the toolchain that makes Poetica a target an LLM or agent can actually code in.
 
-Key files: `plan_ir.py`, `plan_ir_grammar.py` (this repo).
+Key files: `plan_ir.py`, `plan_ir_grammar.py`, `exec_oracle.py` (this repo).
 
 ---
 
@@ -39,15 +39,15 @@ Key files: `plan_ir.py`, `plan_ir_grammar.py` (this repo).
   the highest-value unproven claim.
 
 - **multi-target** — `lower_plan(plan, target)` dispatches to all 6 emitters.
-  **Emits strings for all 6 languages. Only the Python output is verified to
-  be correct.** Non-Python output (Rust, JS, Go, Bash, SQL) has NOT been
-  compiled or executed. Without `exec_oracle`, "multi-target" means
-  "multi-string-emission," not "multi-correct." This is the classic
-  multi-target trap.
+  **Emits strings for all 6 languages. Python output is verified correct
+  by exec_oracle (10 programs executed and checked).** Non-Python output
+  (Rust, JS, Go, Bash, SQL) compiles to temp files but is NOT yet verified
+  to produce correct results. The exec_oracle harness exists for all 5
+  available targets — the missing piece is target-specific bloom patching
+  and cross-target test cases.
 
-  Available toolchains on box: rustc 1.95, node v22, sqlite3 3.37.
-  Missing: go (not installed). A cross-target oracle could verify 4 of 6
-  backends today.
+  Available toolchains on box: rustc 1.95, node v22, sqlite3 3.37, bash.
+  Missing: go (not installed). 5 of 6 backends have runners.
 
 ### Deferred
 
@@ -57,17 +57,38 @@ Key files: `plan_ir.py`, `plan_ir_grammar.py` (this repo).
 
 ---
 
-## Next: exec_oracle
+## exec_oracle — BUILT
 
-The single receipt that backs the most claims at once. Run each emitted
-program against expected I/O. Even a Python-only version gives the real
-MBPP bake-off number. Harness for all future multi-target proofs.
+Cross-target execution harness. `exec_oracle.py` runs emitted programs
+against expected I/O with subprocess execution, timeout, and output
+comparison.
 
-Build order: exec_oracle → MBPP bakeoff (Python) → cross-target oracle
-(Rust/JS/SQL) → GBNF constrained-decode test (needs running model).
+**Python path: VERIFIED.** 10 programs executed — seed, emit, weave
+(scalar + bool), cycle (sum + factorial), for_each, nested when+for_each
+(filter_and_count), conditional, string ops. All produce correct output.
+Bloom (return value) patching captures return values as stdout.
 
-Reasoning: no point proving an LLM can emit valid IR until you've proven
-the IR it emits actually runs correctly across targets.
+**Bug found and fixed:** exec_oracle exposed a nested-indent bug in
+`_plan_op_to_surface()` — children of nested blocks (when inside for_each)
+had flattened indentation, producing invalid Python. Fixed by changing
+absolute indent assignment (`=`) to additive (`+=`). This bug was invisible
+to string-emission tests — only caught by actual execution.
+
+**Other targets:** Runners exist for Rust (compile+run), Node.js, Bash,
+and SQLite. Bloom patching not yet implemented for non-Python targets.
+
+**Failure detection:** wrong output, runtime errors, invalid plans, and
+timeouts are all correctly caught and reported.
+
+## Next: MBPP bakeoff (Python)
+
+With exec_oracle built, the next step is running real MBPP tasks through
+the pipeline: MBPP task description → plan JSON → exec_oracle → score.
+This requires writing plan JSONs for MBPP tasks (either by hand or by
+running an LLM with GBNF constrained decoding).
+
+Build order: MBPP bakeoff (Python) → cross-target oracle (Rust/JS/SQL
+bloom patching) → GBNF constrained-decode test (needs running model).
 
 ---
 
@@ -107,6 +128,8 @@ direct pattern-match-and-emit approach.
 | cycle | BUILT | Python path only | `plan_ir.py` |
 | json+gbnf | BUILT | structural check only — no real LLM test | `plan_ir.py`, `plan_ir_grammar.py` |
 | multi-target lowering | BUILT | string emission only — no compile/execute | `plan_ir.py` |
-| exec_oracle | TODO | | |
-| MBPP bakeoff | TODO | | |
+| exec_oracle | BUILT | 10 Python programs executed correctly, 30 tests | `exec_oracle.py` |
+| nested indent fix | FIXED | caught by exec_oracle, invisible to string tests | `plan_ir.py` |
+| MBPP bakeoff | TODO | needs plan JSONs for MBPP tasks | |
+| cross-target verification | TODO | runners exist, bloom patching needed | `exec_oracle.py` |
 | co-edit | DEFERRED | | |

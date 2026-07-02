@@ -506,7 +506,7 @@ def _plan_op_to_surface(plan_op: PlanOp) -> List[Dict[str, Any]]:
         for child in plan_op.children:
             child_ops = _plan_op_to_surface(child)
             for cop in child_ops:
-                cop["indent"] = plan_op.indent + 1
+                cop["indent"] += plan_op.indent + 1
             result.extend(child_ops)
 
     elif plan_op.op == OpKind.WHEN:
@@ -517,7 +517,7 @@ def _plan_op_to_surface(plan_op: PlanOp) -> List[Dict[str, Any]]:
         for child in plan_op.children:
             child_ops = _plan_op_to_surface(child)
             for cop in child_ops:
-                cop["indent"] = plan_op.indent + 1
+                cop["indent"] += plan_op.indent + 1
             result.extend(child_ops)
 
     elif plan_op.op == OpKind.ELSE:
@@ -527,7 +527,7 @@ def _plan_op_to_surface(plan_op: PlanOp) -> List[Dict[str, Any]]:
         for child in plan_op.children:
             child_ops = _plan_op_to_surface(child)
             for cop in child_ops:
-                cop["indent"] = plan_op.indent + 1
+                cop["indent"] += plan_op.indent + 1
             result.extend(child_ops)
 
     elif plan_op.op == OpKind.WEAVE:
@@ -559,7 +559,7 @@ def _plan_op_to_surface(plan_op: PlanOp) -> List[Dict[str, Any]]:
         for child in plan_op.children:
             child_ops = _plan_op_to_surface(child)
             for cop in child_ops:
-                cop["indent"] = plan_op.indent + 1
+                cop["indent"] += plan_op.indent + 1
             result.extend(child_ops)
 
     elif plan_op.op == OpKind.USE:
