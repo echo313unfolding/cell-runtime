@@ -31,7 +31,7 @@ class RustEmitter(BaseEmitter):
         return "}"
 
     def _op_seed(self, op: Dict[str, Any]) -> str:
-        return f"let {op['name']} = {self._quote(op['value'])};"
+        return f"let mut {op['name']} = {self._quote(op['value'])};"
 
     def _op_grow(self, op: Dict[str, Any]) -> str:
         return f"{op['name']}.push({self._quote(op['source'])});"
@@ -58,7 +58,7 @@ class RustEmitter(BaseEmitter):
         return f"let result = {op['tool']}();"
 
     def _op_when(self, op: Dict[str, Any]) -> str:
-        return f"if {op['condition']} {{"
+        return f"if {self._render_expr(op['condition'])} {{"
 
     def _op_when_in(self, op: Dict[str, Any]) -> str:
         return f"if {op['container']}.contains(&{op['subject']}) {{"
@@ -67,7 +67,7 @@ class RustEmitter(BaseEmitter):
         return f"if {op['left']} == {op['right']} {{"
 
     def _op_else_when(self, op: Dict[str, Any]) -> str:
-        return f"}} else if {op['condition']} {{"
+        return f"}} else if {self._render_expr(op['condition'])} {{"
 
     def _op_else(self, op: Dict[str, Any]) -> str:
         return "} else {"
@@ -76,7 +76,7 @@ class RustEmitter(BaseEmitter):
         return f"let {op['dest']} = {op['source']};"
 
     def _op_bloom(self, op: Dict[str, Any]) -> str:
-        return f"return {self._quote(op['value'])};"
+        return f'println!("{{}}", {self._quote(op["value"])});'
 
     def _op_remember(self, op: Dict[str, Any]) -> str:
         return f'_state.insert("{op["key"]}", {self._quote(op["value"])});'
@@ -85,4 +85,36 @@ class RustEmitter(BaseEmitter):
         return f'// learn pattern: {op["pattern"]}'
 
     def _op_for(self, op: Dict[str, Any]) -> str:
-        return f"for {op['var']} in {op['collection']}.iter() {{"
+        return f"for {op['var']} in {op['collection']} {{"
+
+    # -- Semantic ops (IR-native rendering) ----
+
+    def _render_expr(self, expr) -> str:
+        """Render expression using Rust syntax. Handles string (legacy) and dict (structured)."""
+        if isinstance(expr, dict):
+            from poetica.plan_ir import render_expr_rust
+            return render_expr_rust(expr)
+        # Legacy: string expr with ternary fallback
+        ternary = None
+        from poetica.plan_ir import _parse_ternary
+        ternary = _parse_ternary(str(expr))
+        if ternary:
+            return f"if {ternary['condition']} {{ {ternary['true_val']} }} else {{ {ternary['false_val']} }}"
+        return str(expr)
+
+    def _op_weave(self, op: Dict[str, Any]) -> str:
+        is_reassignment = op.get("is_reassignment", False)
+        rendered = self._render_expr(op["expr"])
+        if is_reassignment:
+            return f"{op['output']} = {rendered};"
+        return f"let mut {op['output']} = {rendered};"
+
+    def _op_cycle_init(self, op: Dict[str, Any]) -> str:
+        return f"let mut {op['accumulator']} = {self._quote(op['init'])};"
+
+    def _op_cycle_for(self, op: Dict[str, Any]) -> str:
+        return f"for {op['iter_var']} in 0..{op['count']} {{"
+
+    def _op_cycle_update(self, op: Dict[str, Any]) -> str:
+        rendered = self._render_expr(op["body_expr"])
+        return f"{op['accumulator']} = {rendered};"

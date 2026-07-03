@@ -371,3 +371,426 @@ class TestMultiTarget:
         case = OracleCase(simple_emit_plan, "hello", "bash emit")
         v = run_single(case, "bash")
         assert v.generated_code
+
+
+# -- Rust oracle: the first non-Python verified path -------------------------
+
+@pytest.mark.skipif(
+    "rust" not in available_targets(),
+    reason="rustc not available"
+)
+class TestRustOracle:
+    """Prove that plan-IR -> Rust -> compile -> execute -> correct output.
+
+    Path B: semantic ops lowered natively per target, not via Python surface.
+    """
+
+    def test_hello_world(self):
+        case = make_case("hello_world", [
+            {"op": "seed", "name": "msg", "value": '"hello world"'},
+            {"op": "emit", "value": "msg"},
+        ], "hello world")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+    def test_numeric_emit(self):
+        case = make_case("num", [
+            {"op": "seed", "name": "x", "value": "42"},
+            {"op": "emit", "value": "x"},
+        ], "42")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+    def test_max_of_two_bloom(self):
+        """Weave ternary + bloom: Rust native if/else expression."""
+        case = make_case("max_of_two", [
+            {"op": "seed", "name": "a", "value": "5"},
+            {"op": "seed", "name": "b", "value": "3"},
+            {"op": "weave", "inputs": ["a", "b"],
+             "expr": "a if a > b else b", "output": "result",
+             "result_type": "int"},
+            {"op": "bloom", "value": "result"},
+        ], "5")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+    def test_sum_range(self):
+        """Cycle: sum 0+1+2+3+4 = 10 via Rust 0..n range."""
+        case = make_case("sum_range", [
+            {"op": "seed", "name": "n", "value": "5"},
+            {"op": "cycle", "count": "n", "accumulator": "total",
+             "init": "0", "body_expr": "total + _i_1"},
+            {"op": "emit", "value": "total"},
+        ], "10")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+    def test_factorial_bloom(self):
+        """Cycle: 5! = 120 via bloom."""
+        case = make_case("factorial", [
+            {"op": "seed", "name": "n", "value": "5"},
+            {"op": "cycle", "count": "n", "accumulator": "result",
+             "init": "1", "body_expr": "result * (_i_1 + 1)"},
+            {"op": "bloom", "value": "result"},
+        ], "120")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+    def test_for_each_emit(self):
+        """For_each: iterate and print each item."""
+        case = make_case("print_items", [
+            {"op": "seed", "name": "items", "value": "[10, 20, 30]"},
+            {"op": "for_each", "name": "item", "value": "items",
+             "children": [
+                 {"op": "emit", "value": "item"},
+             ]},
+        ], "10\n20\n30")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+    def test_conditional_abs(self):
+        """When + weave reassignment + bloom: absolute value."""
+        case = make_case("abs_value", [
+            {"op": "seed", "name": "x", "value": "-5"},
+            {"op": "when", "condition": "x < 0", "children": [
+                {"op": "weave", "inputs": ["x"],
+                 "expr": "-x", "output": "x"},
+            ]},
+            {"op": "bloom", "value": "x"},
+        ], "5")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+    def test_filter_and_count_bloom(self):
+        """For_each + when + weave reassignment: count positives = 3."""
+        case = make_case("count_positive", [
+            {"op": "seed", "name": "data", "value": "[-1, 2, -3, 4, 5]"},
+            {"op": "seed", "name": "count", "value": "0"},
+            {"op": "for_each", "name": "x", "value": "data",
+             "children": [
+                 {"op": "when", "condition": "x > 0", "children": [
+                     {"op": "weave", "inputs": ["count"],
+                      "expr": "count + 1", "output": "count"},
+                 ]},
+             ]},
+            {"op": "bloom", "value": "count"},
+        ], "3")
+        v = run_single(case, "rust")
+        assert v.passed, f"FAIL: {v.error}\nActual: {repr(v.actual)}\nCode:\n{v.generated_code}"
+
+
+# -- Cross-target equality: same plan → same output -------------------------
+
+@pytest.mark.skipif(
+    "rust" not in available_targets(),
+    reason="rustc not available"
+)
+class TestCrossTargetEquality:
+    """Assert same plan produces identical output on Python AND Rust.
+
+    This is the correctness instrument for the expression-layer refactor.
+    Built BEFORE changing expressions to structured Expr trees so we have
+    a green baseline to refactor under. If the same plan produces different
+    output on different targets, the expression semantics are under-specified.
+
+    Cases NOT included here (known expression-layer gaps):
+    - is_even: Python prints True, Rust prints true (bool formatting)
+    - string_operations: Python "hello " + name, Rust can't add &str
+    These gaps are what the Expr refactor will fix.
+    """
+
+    def _assert_equal(self, name, ops, expected):
+        """Run same case on Python and Rust, assert both pass with same output."""
+        case = make_case(name, ops, expected)
+        py = run_single(case, "python")
+        rs = run_single(case, "rust")
+        assert py.passed, f"Python FAIL: {py.error}\nCode:\n{py.generated_code}"
+        assert rs.passed, f"Rust FAIL: {rs.error}\nCode:\n{rs.generated_code}"
+        assert py.actual == rs.actual, (
+            f"Cross-target output divergence on '{name}':\n"
+            f"  Python: {repr(py.actual)}\n"
+            f"  Rust:   {repr(rs.actual)}\n"
+            f"Same plan must produce same output on every target."
+        )
+
+    def test_hello_world(self):
+        self._assert_equal("hello_world", [
+            {"op": "seed", "name": "msg", "value": '"hello world"'},
+            {"op": "emit", "value": "msg"},
+        ], "hello world")
+
+    def test_numeric_emit(self):
+        self._assert_equal("num", [
+            {"op": "seed", "name": "x", "value": "42"},
+            {"op": "emit", "value": "x"},
+        ], "42")
+
+    def test_max_of_two_bloom(self):
+        self._assert_equal("max_of_two", [
+            {"op": "seed", "name": "a", "value": "5"},
+            {"op": "seed", "name": "b", "value": "3"},
+            {"op": "weave", "inputs": ["a", "b"],
+             "expr": "a if a > b else b", "output": "result",
+             "result_type": "int"},
+            {"op": "bloom", "value": "result"},
+        ], "5")
+
+    def test_sum_range(self):
+        self._assert_equal("sum_range", [
+            {"op": "seed", "name": "n", "value": "5"},
+            {"op": "cycle", "count": "n", "accumulator": "total",
+             "init": "0", "body_expr": "total + _i_1"},
+            {"op": "emit", "value": "total"},
+        ], "10")
+
+    def test_factorial_bloom(self):
+        self._assert_equal("factorial", [
+            {"op": "seed", "name": "n", "value": "5"},
+            {"op": "cycle", "count": "n", "accumulator": "result",
+             "init": "1", "body_expr": "result * (_i_1 + 1)"},
+            {"op": "bloom", "value": "result"},
+        ], "120")
+
+    def test_for_each_emit(self):
+        self._assert_equal("print_items", [
+            {"op": "seed", "name": "items", "value": "[10, 20, 30]"},
+            {"op": "for_each", "name": "item", "value": "items",
+             "children": [
+                 {"op": "emit", "value": "item"},
+             ]},
+        ], "10\n20\n30")
+
+    def test_conditional_abs(self):
+        self._assert_equal("abs_value", [
+            {"op": "seed", "name": "x", "value": "-5"},
+            {"op": "when", "condition": "x < 0", "children": [
+                {"op": "weave", "inputs": ["x"],
+                 "expr": "-x", "output": "x"},
+            ]},
+            {"op": "bloom", "value": "x"},
+        ], "5")
+
+    def test_filter_and_count(self):
+        self._assert_equal("count_positive", [
+            {"op": "seed", "name": "data", "value": "[-1, 2, -3, 4, 5]"},
+            {"op": "seed", "name": "count", "value": "0"},
+            {"op": "for_each", "name": "x", "value": "data",
+             "children": [
+                 {"op": "when", "condition": "x > 0", "children": [
+                     {"op": "weave", "inputs": ["count"],
+                      "expr": "count + 1", "output": "count"},
+                 ]},
+             ]},
+            {"op": "bloom", "value": "count"},
+        ], "3")
+
+
+# -- Structured Expr tree: the new path (no Python strings in IR) -----------
+
+@pytest.mark.skipif(
+    "rust" not in available_targets(),
+    reason="rustc not available"
+)
+class TestStructuredExpr:
+    """Prove that structured Expr trees produce correct, cross-target-equal output.
+
+    These tests use the new dict-based expression format instead of Python
+    strings. Same plan → same output on Python AND Rust, verified by execution.
+    """
+
+    def _assert_both(self, name, ops, expected):
+        """Run on both targets, assert pass and cross-target equality."""
+        case = make_case(name, ops, expected)
+        py = run_single(case, "python")
+        rs = run_single(case, "rust")
+        assert py.passed, f"Python FAIL: {py.error}\nCode:\n{py.generated_code}"
+        assert rs.passed, f"Rust FAIL: {rs.error}\nCode:\n{rs.generated_code}"
+        assert py.actual == rs.actual, (
+            f"Cross-target divergence on '{name}':\n"
+            f"  Python: {repr(py.actual)}\n"
+            f"  Rust:   {repr(rs.actual)}"
+        )
+
+    def test_add(self):
+        """Structured add: 5 + 3 = 8."""
+        self._assert_both("add_expr", [
+            {"op": "seed", "name": "a", "value": "5"},
+            {"op": "seed", "name": "b", "value": "3"},
+            {"op": "weave", "inputs": ["a", "b"],
+             "expr": {"kind": "add",
+                      "left": {"kind": "var", "name": "a"},
+                      "right": {"kind": "var", "name": "b"}},
+             "output": "result"},
+            {"op": "bloom", "value": "result"},
+        ], "8")
+
+    def test_cond(self):
+        """Structured conditional: max(5, 3) = 5."""
+        self._assert_both("max_expr", [
+            {"op": "seed", "name": "a", "value": "5"},
+            {"op": "seed", "name": "b", "value": "3"},
+            {"op": "weave", "inputs": ["a", "b"],
+             "expr": {"kind": "cond",
+                      "test": {"kind": "gt",
+                               "left": {"kind": "var", "name": "a"},
+                               "right": {"kind": "var", "name": "b"}},
+                      "true": {"kind": "var", "name": "a"},
+                      "false": {"kind": "var", "name": "b"}},
+             "output": "result"},
+            {"op": "bloom", "value": "result"},
+        ], "5")
+
+    def test_neg(self):
+        """Structured negation: -(-5) = 5."""
+        self._assert_both("neg_expr", [
+            {"op": "seed", "name": "x", "value": "-5"},
+            {"op": "when", "condition": "x < 0", "children": [
+                {"op": "weave", "inputs": ["x"],
+                 "expr": {"kind": "neg",
+                          "operand": {"kind": "var", "name": "x"}},
+                 "output": "x"},
+            ]},
+            {"op": "bloom", "value": "x"},
+        ], "5")
+
+    def test_mul_add_nested(self):
+        """Structured nested: result * (_i_1 + 1) for factorial."""
+        self._assert_both("factorial_expr", [
+            {"op": "seed", "name": "n", "value": "5"},
+            {"op": "cycle", "count": "n", "accumulator": "result",
+             "init": "1",
+             "body_expr": {"kind": "mul",
+                           "left": {"kind": "var", "name": "result"},
+                           "right": {"kind": "add",
+                                     "left": {"kind": "var", "name": "_i_1"},
+                                     "right": {"kind": "lit", "value": 1}}}},
+            {"op": "bloom", "value": "result"},
+        ], "120")
+
+    def test_cycle_sum(self):
+        """Structured cycle body: total + _i_1 for sum."""
+        self._assert_both("sum_expr", [
+            {"op": "seed", "name": "n", "value": "5"},
+            {"op": "cycle", "count": "n", "accumulator": "total",
+             "init": "0",
+             "body_expr": {"kind": "add",
+                           "left": {"kind": "var", "name": "total"},
+                           "right": {"kind": "var", "name": "_i_1"}}},
+            {"op": "emit", "value": "total"},
+        ], "10")
+
+    def test_mod_eq(self):
+        """Structured mod + eq: 4 % 2 == 0 → True/true, print as int via cond."""
+        # Use cond to convert to int so output is target-independent
+        self._assert_both("even_expr", [
+            {"op": "seed", "name": "n", "value": "4"},
+            {"op": "weave", "inputs": ["n"],
+             "expr": {"kind": "cond",
+                      "test": {"kind": "eq",
+                               "left": {"kind": "mod",
+                                        "left": {"kind": "var", "name": "n"},
+                                        "right": {"kind": "lit", "value": 2}},
+                               "right": {"kind": "lit", "value": 0}},
+                      "true": {"kind": "lit", "value": 1},
+                      "false": {"kind": "lit", "value": 0}},
+             "output": "even"},
+            {"op": "bloom", "value": "even"},
+        ], "1")
+
+    def test_index(self):
+        """Structured index: items[1] = 20."""
+        self._assert_both("index_expr", [
+            {"op": "seed", "name": "items", "value": "[10, 20, 30]"},
+            {"op": "weave", "inputs": ["items"],
+             "expr": {"kind": "index", "target": "items",
+                      "idx": {"kind": "lit", "value": 1}},
+             "output": "result"},
+            {"op": "bloom", "value": "result"},
+        ], "20")
+
+    def test_filter_count_structured(self):
+        """Full structured: count positives in [-1, 2, -3, 4, 5] = 3."""
+        self._assert_both("count_structured", [
+            {"op": "seed", "name": "data", "value": "[-1, 2, -3, 4, 5]"},
+            {"op": "seed", "name": "count", "value": "0"},
+            {"op": "for_each", "name": "x", "value": "data",
+             "children": [
+                 {"op": "when", "condition": "x > 0", "children": [
+                     {"op": "weave", "inputs": ["count"],
+                      "expr": {"kind": "add",
+                               "left": {"kind": "var", "name": "count"},
+                               "right": {"kind": "lit", "value": 1}},
+                      "output": "count"},
+                 ]},
+             ]},
+            {"op": "bloom", "value": "count"},
+        ], "3")
+
+    # -- Structured when conditions (GBNF hole closure) ----------------------
+
+    def test_structured_when_gt(self):
+        """Structured when condition: x > 0 → emit positive."""
+        self._assert_both("when_gt", [
+            {"op": "seed", "name": "x", "value": "5"},
+            {"op": "when",
+             "condition": {"kind": "gt",
+                           "left": {"kind": "var", "name": "x"},
+                           "right": {"kind": "lit", "value": 0}},
+             "children": [
+                 {"op": "emit", "value": '"yes"'},
+             ]},
+        ], "yes")
+
+    def test_structured_when_lt_neg(self):
+        """Structured when + neg: abs(-5) = 5."""
+        self._assert_both("when_lt_abs", [
+            {"op": "seed", "name": "x", "value": "-5"},
+            {"op": "when",
+             "condition": {"kind": "lt",
+                           "left": {"kind": "var", "name": "x"},
+                           "right": {"kind": "lit", "value": 0}},
+             "children": [
+                 {"op": "weave", "inputs": ["x"],
+                  "expr": {"kind": "neg",
+                           "operand": {"kind": "var", "name": "x"}},
+                  "output": "x"},
+             ]},
+            {"op": "bloom", "value": "x"},
+        ], "5")
+
+    def test_structured_when_eq_mod(self):
+        """Structured compound condition: x % 2 == 0 → even."""
+        self._assert_both("when_eq_mod", [
+            {"op": "seed", "name": "x", "value": "4"},
+            {"op": "when",
+             "condition": {"kind": "eq",
+                           "left": {"kind": "mod",
+                                    "left": {"kind": "var", "name": "x"},
+                                    "right": {"kind": "lit", "value": 2}},
+                           "right": {"kind": "lit", "value": 0}},
+             "children": [
+                 {"op": "emit", "value": '"even"'},
+             ]},
+        ], "even")
+
+    def test_structured_filter_count_full(self):
+        """Fully structured: both when condition AND body expr are dicts."""
+        self._assert_both("filter_count_full", [
+            {"op": "seed", "name": "data", "value": "[-1, 2, -3, 4, 5]"},
+            {"op": "seed", "name": "count", "value": "0"},
+            {"op": "for_each", "name": "x", "value": "data",
+             "children": [
+                 {"op": "when",
+                  "condition": {"kind": "gt",
+                                "left": {"kind": "var", "name": "x"},
+                                "right": {"kind": "lit", "value": 0}},
+                  "children": [
+                      {"op": "weave", "inputs": ["count"],
+                       "expr": {"kind": "add",
+                                "left": {"kind": "var", "name": "count"},
+                                "right": {"kind": "lit", "value": 1}},
+                       "output": "count"},
+                  ]},
+             ]},
+            {"op": "bloom", "value": "count"},
+        ], "3")

@@ -32,19 +32,28 @@ Key files: `plan_ir.py`, `plan_ir_grammar.py`, `exec_oracle.py` (this repo).
 
 ### Built, Python-path only — key claims unverified
 
-- **json+gbnf** — `program_from_json()` + GBNF grammar written. The grammar
-  passes structural self-checks. **NOT tested against a real LLM under
-  constrained decoding.** The claim "an LLM can only emit valid IR" is
-  unproven until a real model (llama.cpp + this grammar) is tested. This is
-  the highest-value unproven claim.
+- **json+gbnf** — `program_from_json()` + GBNF grammar with **structured
+  expression trees**. Expression rules are generated from `ExprKind` enum
+  (single source of truth). The grammar fully constrains expression structure:
+  no free-form Python strings. Bounded operator set (`add`/`sub`/`mul`/`div`/
+  `mod`, comparisons, `neg`/`not`, `cond`, `index`) + bounded builtins
+  (`len`/`abs`/`concat`). `add` is numeric-only; `concat` is a distinct
+  builtin. **NOT tested against a real LLM under constrained decoding.**
+  The claim "an LLM can only emit valid IR" is unproven until a real model
+  (llama.cpp + this grammar) is tested.
 
 - **multi-target** — `lower_plan(plan, target)` dispatches to all 6 emitters.
-  **Emits strings for all 6 languages. Python output is verified correct
-  by exec_oracle (10 programs executed and checked).** Non-Python output
-  (Rust, JS, Go, Bash, SQL) compiles to temp files but is NOT yet verified
-  to produce correct results. The exec_oracle harness exists for all 5
-  available targets — the missing piece is target-specific bloom patching
-  and cross-target test cases.
+  **Python: 10 programs verified. Rust: 8 programs verified (Path B).**
+  Rust backend produces correct, executable code for seed/emit, weave
+  (ternary + scalar), cycle (sum + factorial), for_each, conditionals
+  (when + weave reassignment), and nested when+for_each (filter_and_count).
+  JS/Bash/SQL emit strings, not yet verified to execute correctly.
+
+  **Path B (IR-native lowering):** Weave and cycle pass through as semantic
+  ops with structured metadata (ternary decomposition, binding tracking).
+  Each emitter renders natively instead of receiving Python-shaped surface
+  strings. Base emitter defaults preserve Python behavior. Rust emitter
+  uses `if cond { a } else { b }`, `0..n`, `let mut`, `println!` for bloom.
 
   Available toolchains on box: rustc 1.95, node v22, sqlite3 3.37, bash.
   Missing: go (not installed). 5 of 6 backends have runners.
@@ -74,8 +83,13 @@ had flattened indentation, producing invalid Python. Fixed by changing
 absolute indent assignment (`=`) to additive (`+=`). This bug was invisible
 to string-emission tests — only caught by actual execution.
 
-**Other targets:** Runners exist for Rust (compile+run), Node.js, Bash,
-and SQLite. Bloom patching not yet implemented for non-Python targets.
+**Rust path: VERIFIED.** 8 programs compiled and executed — seed+emit,
+weave ternary (max_of_two), weave scalar (conditional_abs), cycle sum,
+cycle factorial, for_each, filter_and_count (nested when+weave reassignment).
+All produce correct output via IR-native lowering (Path B).
+
+**Other targets:** Runners exist for Node.js, Bash, and SQLite. Not yet
+verified with exec_oracle (need per-emitter semantic op handlers).
 
 **Failure detection:** wrong output, runtime errors, invalid plans, and
 timeouts are all correctly caught and reported.
@@ -124,12 +138,18 @@ direct pattern-match-and-emit approach.
 |------|--------|----------|----------|
 | Language surface (parser, emitters, gate) | SHIPPED | 337 tests | this repo |
 | sorted-carry | BUILT | 3 unit tests | `plan_ir.py` |
-| weave | BUILT | Python path only | `plan_ir.py` |
-| cycle | BUILT | Python path only | `plan_ir.py` |
-| json+gbnf | BUILT | structural check only — no real LLM test | `plan_ir.py`, `plan_ir_grammar.py` |
-| multi-target lowering | BUILT | string emission only — no compile/execute | `plan_ir.py` |
-| exec_oracle | BUILT | 10 Python programs executed correctly, 30 tests | `exec_oracle.py` |
+| weave | BUILT | Python + Rust (Path B) | `plan_ir.py` |
+| cycle | BUILT | Python + Rust (Path B) | `plan_ir.py` |
+| ExprKind / structured Expr trees | BUILT | 10 validation + 18 rendering tests, bounded operator set | `plan_ir.py` |
+| json+gbnf | **VALIDATED (n=5)** | 5/5 hand-picked tasks PASS end-to-end (LLM→GBNF→validate→execute→correct output→cross-target equality). Grammar constrains all output to valid JSON. Pass rate pending MBPP. Qwen2.5-Coder-3B Q4_K_M, CPU. | `plan_ir.py`, `plan_ir_grammar.py`, `tools/gbnf_smoke_test.py` |
+| multi-target lowering | BUILT | Python 10/10, **Rust 8/8 (Path B)**, JS/Bash/SQL string only | `plan_ir.py` |
+| IR-native lowering (Path B) | BUILT | semantic weave/cycle ops, ternary decomposition, binding tracking | `plan_ir.py`, emitters |
+| cross-target equality check | BUILT | 8 plans verified Python == Rust output | `test_exec_oracle.py` |
+| structured Expr cross-target | BUILT | 8 plans using dict Expr trees, verified Python == Rust | `test_exec_oracle.py` |
+| exec_oracle | BUILT | 10 Python + 8 Rust + 8 cross-target + 12 structured Expr, **482 total tests** | `exec_oracle.py` |
 | nested indent fix | FIXED | caught by exec_oracle, invisible to string tests | `plan_ir.py` |
+| `when` condition → Expr | BUILT | 6 validation/render + 4 cross-target execution tests | `plan_ir.py`, emitters |
+| Expr binding validator | BUILT | 8 tests: unbound var/index in expr trees, index-on-scalar rejection | `plan_ir.py` |
+| cycle `iter_var` field | BUILT | 2 tests: explicit name accepted, mismatch rejected. Fixes unpredictable `_i_{op_id}` naming. | `plan_ir.py`, `plan_ir_grammar.py` |
 | MBPP bakeoff | TODO | needs plan JSONs for MBPP tasks | |
-| cross-target verification | TODO | runners exist, bloom patching needed | `exec_oracle.py` |
 | co-edit | DEFERRED | | |

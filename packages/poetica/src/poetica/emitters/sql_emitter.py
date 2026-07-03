@@ -49,7 +49,7 @@ class SQLEmitter(BaseEmitter):
         return f"CALL {op['tool']}();"
 
     def _op_when(self, op: Dict[str, Any]) -> str:
-        return f"-- WHEN: {op['condition']}"
+        return f"-- WHEN: {self._render_expr(op['condition'])}"
 
     def _op_when_in(self, op: Dict[str, Any]) -> str:
         return f"SELECT * FROM {op['container']} WHERE value = {self._quote(op['subject'])};"
@@ -58,7 +58,7 @@ class SQLEmitter(BaseEmitter):
         return f"SELECT CASE WHEN @{op['left']} = @{op['right']} THEN 'match' ELSE 'no match' END;"
 
     def _op_else_when(self, op: Dict[str, Any]) -> str:
-        return f"-- ELSE WHEN: {op['condition']}"
+        return f"-- ELSE WHEN: {self._render_expr(op['condition'])}"
 
     def _op_else(self, op: Dict[str, Any]) -> str:
         return "-- ELSE:"

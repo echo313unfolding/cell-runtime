@@ -58,7 +58,7 @@ class BashEmitter(BaseEmitter):
         return f'{op["tool"]} {params}'.strip()
 
     def _op_when(self, op: Dict[str, Any]) -> str:
-        return f'if [[ {op["condition"]} ]]; then'
+        return f'if [[ {self._render_expr(op["condition"])} ]]; then'
 
     def _op_when_in(self, op: Dict[str, Any]) -> str:
         return f'if echo "${{{op["container"]}}}" | grep -q "{op["subject"]}"; then'
@@ -67,7 +67,7 @@ class BashEmitter(BaseEmitter):
         return f'if [[ "{op["left"]}" == "{op["right"]}" ]]; then'
 
     def _op_else_when(self, op: Dict[str, Any]) -> str:
-        return f'elif [[ {op["condition"]} ]]; then'
+        return f'elif [[ {self._render_expr(op["condition"])} ]]; then'
 
     def _op_else(self, op: Dict[str, Any]) -> str:
         return "else"

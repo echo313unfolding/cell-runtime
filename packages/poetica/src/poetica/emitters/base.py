@@ -8,7 +8,7 @@ class BaseEmitter:
     COMMENT = "#"
     LANG = "unknown"
 
-    _BLOCK_OPENERS = {"when", "when_in", "if"}
+    _BLOCK_OPENERS = {"when", "when_in", "if", "cycle_for"}
     _BLOCK_CONTINUATIONS = {"else_when", "else"}
 
     def emit(self, ir: Dict[str, Any]) -> str:
@@ -17,7 +17,7 @@ class BaseEmitter:
         if header:
             lines.extend(header)
 
-        name = ir.get("name", "program")
+        name = ir.get("name") or "main"
         lines.extend(self._fn_open(name))
 
         preamble = self._fn_preamble(ir)
@@ -99,6 +99,27 @@ class BaseEmitter:
         if method:
             return method(op)
         return f"{self.COMMENT} {op['op']}: {op}"
+
+    # -- Semantic op defaults (Python-compatible) ----
+
+    def _render_expr(self, expr) -> str:
+        """Render an expression. Handles both legacy strings and structured Expr dicts."""
+        if isinstance(expr, dict):
+            from poetica.plan_ir import render_expr_python
+            return render_expr_python(expr)
+        return str(expr)
+
+    def _op_weave(self, op: Dict[str, Any]) -> str:
+        return f"{op['output']} = {self._render_expr(op['expr'])}"
+
+    def _op_cycle_init(self, op: Dict[str, Any]) -> str:
+        return f"{op['accumulator']} = {self._quote(op['init'])}"
+
+    def _op_cycle_for(self, op: Dict[str, Any]) -> str:
+        return f"for {op['iter_var']} in range({op['count']}):"
+
+    def _op_cycle_update(self, op: Dict[str, Any]) -> str:
+        return f"{op['accumulator']} = {self._render_expr(op['body_expr'])}"
 
     def _quote(self, value: str) -> str:
         if not value:

@@ -75,7 +75,7 @@ class GoEmitter(BaseEmitter):
         return f"result := {op['tool']}()"
 
     def _op_when(self, op: Dict[str, Any]) -> str:
-        return f"if {op['condition']} {{"
+        return f"if {self._render_expr(op['condition'])} {{"
 
     def _op_when_in(self, op: Dict[str, Any]) -> str:
         return f"if contains({op['container']}, {op['subject']}) {{"
@@ -84,7 +84,7 @@ class GoEmitter(BaseEmitter):
         return f"if {op['left']} == {op['right']} {{"
 
     def _op_else_when(self, op: Dict[str, Any]) -> str:
-        return f"}} else if {op['condition']} {{"
+        return f"}} else if {self._render_expr(op['condition'])} {{"
 
     def _op_else(self, op: Dict[str, Any]) -> str:
         return "} else {"
