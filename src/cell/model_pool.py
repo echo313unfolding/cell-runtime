@@ -191,10 +191,13 @@ class ModelPool:
         if not gguf_path or not os.path.exists(gguf_path):
             return {"error": f"GGUF not found for {model}: {gguf_path}"}
 
-        # Find llama-server binary
+        # Find llama-server binary (prefer AF6-capable stage1 build)
         llama_server = None
-        for candidate in ["/usr/local/bin/llama-server",
-                          os.path.expanduser("~/llama.cpp/build/bin/llama-server")]:
+        for candidate in [
+            os.path.expanduser("~/llama-cpp-stage1/build/bin/llama-server"),
+            os.path.expanduser("~/llama-cpp-fresh/build/bin/llama-server"),
+            "/usr/local/bin/llama-server",
+        ]:
             if os.path.exists(candidate):
                 llama_server = candidate
                 break
@@ -222,7 +225,7 @@ class ModelPool:
              "--port", port,
              "--ctx-size", str(gen_cfg["n_ctx"]),
              "--n-gpu-layers", str(gen_cfg["n_gpu_layers"]),
-             "--host", "0.0.0.0"],
+             "--host", "127.0.0.1"],
             stdout=open(log_path, "w"),
             stderr=subprocess.STDOUT,
             env=env,
@@ -248,7 +251,7 @@ class ModelPool:
         return {"error": f"llama-server did not respond within 120s. Check {log_path}"}
 
     def _llama_server_stop(self):
-        """Stop the llama-server process."""
+        """Stop the managed llama-server process (only the one we started)."""
         if self._llama_proc and self._llama_proc.poll() is None:
             try:
                 os.killpg(os.getpgid(self._llama_proc.pid), signal.SIGTERM)
@@ -260,16 +263,6 @@ class ModelPool:
                     pass
             self._llama_proc = None
         self._llama_current_model = None
-        # Kill orphaned llama-server processes
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "llama-server"],
-                capture_output=True, text=True, timeout=5)
-            for pid in result.stdout.strip().split("\n"):
-                if pid.strip():
-                    os.kill(int(pid.strip()), signal.SIGTERM)
-        except Exception:
-            pass
 
     # ── Unified interface ──
 
@@ -306,7 +299,6 @@ class ModelPool:
         current_backend = self._backend_for(current) if current and current in self.roster else None
 
         # ── Free VRAM from current backend ──
-        # Always check for rogue llama-server processes holding the GPU
         self._llama_server_stop()
         if current_backend == "helix" or self._helix_alive():
             self._helix_stop()
