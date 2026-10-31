@@ -58,6 +58,19 @@ class Orchestrator:
         self.default_model = self.config.get("default_model", "smollm3")
         self.gen_opts = self.config.get("generation", {})
 
+        # Context strategy. Env var wins over config so an A/B harness can
+        # flip it per-process without touching config.json.
+        #   CELL_CONTEXT_COMPILER=0  → legacy capsule + raw history + full registry
+        #   CELL_CONTEXT_COMPILER=1  → CPU-side compiler (default)
+        ctx_cfg = self.config.get("context_compiler", {})
+        env_flag = os.environ.get("CELL_CONTEXT_COMPILER")
+        if env_flag is not None:
+            self.context_compiler_enabled = env_flag.strip().lower() not in ("0", "false", "off", "")
+        else:
+            self.context_compiler_enabled = bool(ctx_cfg.get("enabled", True))
+        self.context_token_budget = int(
+            os.environ.get("CELL_CONTEXT_BUDGET", ctx_cfg.get("token_budget", 1200)))
+
         self.tool_registry = create_default_registry()
 
         # Wire agents to orchestrator if available
@@ -162,10 +175,18 @@ class Orchestrator:
         choice = data.get("choices", [{}])[0]
         content = choice.get("message", {}).get("content", "")
         usage = data.get("usage", {})
+        # llama-server also returns a `timings` block with measured
+        # prompt/predict counts and wall-clock ms. Prefer it over `usage`
+        # when present — it's the real number, not an estimate.
+        timings = data.get("timings") or {}
         return {
             "content": content,
-            "eval_count": usage.get("completion_tokens", 0),
-            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "eval_count": timings.get("predicted_n",
+                                      usage.get("completion_tokens", 0)),
+            "prompt_tokens": timings.get("prompt_n",
+                                         usage.get("prompt_tokens", 0)),
+            "prompt_ms": timings.get("prompt_ms", 0.0),
+            "predicted_ms": timings.get("predicted_ms", 0.0),
         }
 
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
@@ -197,8 +218,32 @@ class Orchestrator:
 
         total_eval_count = 0
         total_eval_duration = 0
+        total_prompt_tokens = 0
+        total_prompt_ms = 0.0
+        first_prompt_tokens = None   # prompt size of the FIRST call = context cost
+        timings_measured = False
         tool_calls_log = []
         data = None
+
+        def _result(content: str, **extra) -> dict:
+            out = {
+                "content": content,
+                "eval_count": total_eval_count,
+                "eval_duration": total_eval_duration,
+                "prompt_eval_duration": (
+                    int(total_prompt_ms * 1e6) if timings_measured
+                    else (data.get("prompt_eval_duration", 0)
+                          if backend == "ollama" and data else 0)),
+                "total_duration": (
+                    data.get("total_duration", 0)
+                    if backend == "ollama" and data else 0),
+                "prompt_tokens": total_prompt_tokens,
+                "first_prompt_tokens": first_prompt_tokens or 0,
+                "timings_measured": timings_measured,
+                "tool_calls": tool_calls_log,
+            }
+            out.update(extra)
+            return out
 
         for turn in range(MAX_TOOL_TURNS if use_tools else 1):
             if backend in ("helix", "llama-server"):
@@ -210,9 +255,18 @@ class Orchestrator:
                                        temperature=opts["temperature"])
                 content = hx["content"]
                 total_eval_count += hx["eval_count"]
-                rated_toks = self.roster.get(model, {}).get("tok_s", 10)
-                est_dur_ns = int(hx["eval_count"] / rated_toks * 1e9) if rated_toks else 0
-                total_eval_duration += est_dur_ns
+                total_prompt_tokens += hx.get("prompt_tokens", 0)
+                if first_prompt_tokens is None:
+                    first_prompt_tokens = hx.get("prompt_tokens", 0)
+                if hx.get("predicted_ms"):
+                    # Real wall-clock from llama-server timings
+                    total_eval_duration += int(hx["predicted_ms"] * 1e6)
+                    total_prompt_ms += hx.get("prompt_ms", 0.0)
+                    timings_measured = True
+                else:
+                    rated_toks = self.roster.get(model, {}).get("tok_s", 10)
+                    est_dur_ns = int(hx["eval_count"] / rated_toks * 1e9) if rated_toks else 0
+                    total_eval_duration += est_dur_ns
             else:
                 payload = {
                     "model": model,
@@ -227,27 +281,13 @@ class Orchestrator:
                 total_eval_duration += data.get("eval_duration", 0)
 
             if not use_tools:
-                return {
-                    "content": content,
-                    "eval_count": total_eval_count,
-                    "eval_duration": total_eval_duration,
-                    "prompt_eval_duration": data.get("prompt_eval_duration", 0) if backend == "ollama" and data else 0,
-                    "total_duration": data.get("total_duration", 0) if backend == "ollama" and data else 0,
-                    "tool_calls": [],
-                }
+                return _result(content)
 
             # Check for tool calls
             calls = parse_tool_calls(content)
             if not calls:
                 # No tool calls — model is done
-                return {
-                    "content": content,
-                    "eval_count": total_eval_count,
-                    "eval_duration": total_eval_duration,
-                    "prompt_eval_duration": data.get("prompt_eval_duration", 0) if backend == "ollama" and data else 0,
-                    "total_duration": data.get("total_duration", 0) if backend == "ollama" and data else 0,
-                    "tool_calls": tool_calls_log,
-                }
+                return _result(content)
 
             # Execute tool calls and feed results back
             messages.append({"role": "assistant", "content": content})
@@ -298,25 +338,10 @@ class Orchestrator:
 
             # If there were escalations, include them in the result
             if escalations:
-                return {
-                    "content": content,
-                    "eval_count": total_eval_count,
-                    "eval_duration": total_eval_duration,
-                    "prompt_eval_duration": data.get("prompt_eval_duration", 0) if backend == "ollama" and data else 0,
-                    "total_duration": data.get("total_duration", 0) if backend == "ollama" and data else 0,
-                    "tool_calls": tool_calls_log,
-                    "escalations": escalations,
-                }
+                return _result(content, escalations=escalations)
 
         # Max turns reached
-        return {
-            "content": content,
-            "eval_count": total_eval_count,
-            "eval_duration": total_eval_duration,
-            "prompt_eval_duration": 0,
-            "total_duration": 0,
-            "tool_calls": tool_calls_log,
-        }
+        return _result(content, max_turns_reached=True)
 
     def _log_swap(self, swap_result: dict, task_id: str, intent: str):
         """Append swap event to JSONL log."""
@@ -446,42 +471,60 @@ class Orchestrator:
                 # Specialist not available — fall through to generic path
                 pass
 
-        # 7. Compile context on CPU — search receipts, graph, memory
-        history_summary = ""
-        if history:
-            # Compress prior turns into a compact summary
-            for i in range(0, len(history) - 1, 2):
-                if (history[i].get("role") == "user" and
-                        i + 1 < len(history) and
-                        history[i + 1].get("role") == "assistant"):
-                    turn_sum = summarize_turn(
-                        history[i]["content"],
-                        history[i + 1]["content"],
-                    )
-                    if turn_sum:
-                        history_summary += turn_sum + "\n"
+        # 7. Build the prompt context. Two modes, selected by
+        #    CELL_CONTEXT_COMPILER (env, default on):
+        #      "1"  compiler  — CPU-side evidence packet, compressed history,
+        #                       lean per-intent tool registry (step 7/8 as of 9b67b64)
+        #      "0"  legacy    — memory capsule appended to input, raw history
+        #                       passed through, full tool registry (pre-9b67b64)
+        #    The legacy path exists so A/B runs can hit the same orchestrator,
+        #    binary and model with only the context strategy varying.
+        context_mode = "compiler" if self.context_compiler_enabled else "legacy"
+        compiled = {"evidence": "", "sources": [], "tokens_est": 0, "searches": []}
+        gen_history = None
 
-        compiled = compile_context(
-            user_input, intent,
-            history_summary=history_summary,
-            token_budget=1200,
-        )
+        if context_mode == "compiler":
+            history_summary = ""
+            if history:
+                # Compress prior turns into a compact summary (chronological;
+                # compile_context keeps the tail if it has to trim)
+                for i in range(0, len(history) - 1, 2):
+                    if (history[i].get("role") == "user" and
+                            i + 1 < len(history) and
+                            history[i + 1].get("role") == "assistant"):
+                        turn_sum = summarize_turn(
+                            history[i]["content"],
+                            history[i + 1]["content"],
+                        )
+                        if turn_sum:
+                            history_summary += turn_sum + "\n"
 
-        # Build augmented input: question + compiled evidence
-        augmented_input = user_input
-        if compiled["evidence"]:
-            augmented_input = (
-                f"{user_input}\n\n"
-                f"--- Evidence (retrieved from local files) ---\n"
-                f"{compiled['evidence']}\n"
-                f"--- End evidence ---"
+            compiled = compile_context(
+                user_input, intent,
+                history_summary=history_summary,
+                token_budget=self.context_token_budget,
             )
 
-        # 8. Generate (with optional tool loop, lean registry, compressed history)
-        lean_reg = self._lean_registry(intent) if use_tools else None
-        # Don't pass raw history — it's already compressed into the evidence block
+            # Build augmented input: question + compiled evidence
+            augmented_input = user_input
+            if compiled["evidence"]:
+                augmented_input = (
+                    f"{user_input}\n\n"
+                    f"--- Evidence (retrieved from local files) ---\n"
+                    f"{compiled['evidence']}\n"
+                    f"--- End evidence ---"
+                )
+            active_reg = self._lean_registry(intent) if use_tools else None
+            # Raw history is NOT passed — it's compressed into the evidence block
+        else:
+            capsule_ctx = self.memory.get_capsule_prompt()
+            augmented_input = user_input + capsule_ctx if capsule_ctx else user_input
+            active_reg = None            # _generate falls back to the full registry
+            gen_history = history
+
+        # 8. Generate (with optional tool loop)
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
-                                    tool_registry=lean_reg)
+                                    history=gen_history, tool_registry=active_reg)
 
         # 9. Feed result to memory lane
         self.memory.ingest({
@@ -524,8 +567,14 @@ class Orchestrator:
             "tok_s": round(tok_s, 2),
             "ttft_ns": gen_result.get("prompt_eval_duration", 0),
             "total_duration_ns": gen_result.get("total_duration", 0),
+            # Measured by llama-server when timings_measured is True;
+            # otherwise estimated from the roster tok_s.
+            "prompt_tokens": gen_result.get("prompt_tokens", 0),
+            "first_prompt_tokens": gen_result.get("first_prompt_tokens", 0),
+            "timings_measured": gen_result.get("timings_measured", False),
         }
         task_dict["specialist_adapter_used"] = False
+        task_dict["context_mode"] = context_mode
         task_dict["context_compiled"] = {
             "tokens_est": compiled["tokens_est"],
             "sources": compiled["sources"],
@@ -557,6 +606,10 @@ class Orchestrator:
             "tool_calls": len(tool_calls),
             "receipt": str(task_path),
             "memory_turn": self.memory.state.get("turn_count", 0),
+            "context_mode": context_mode,
+            "prompt_tokens": gen_result.get("prompt_tokens", 0),
+            "first_prompt_tokens": gen_result.get("first_prompt_tokens", 0),
+            "timings_measured": gen_result.get("timings_measured", False),
             "context_compiled": {
                 "tokens_est": compiled["tokens_est"],
                 "sources": compiled["sources"],

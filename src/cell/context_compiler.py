@@ -12,12 +12,21 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
 
-# Rough approximation: 1 token ≈ 4 characters
+# Rough approximation: 1 token ≈ 4 characters.
+# NOTE: receipt JSON (paths, numbers, underscores) tokenizes closer to ~3
+# chars/token on Qwen2.5. tokens_est is a lower bound; measure the real
+# prompt_n from llama-server's `timings` when it matters.
 CHARS_PER_TOKEN = 4
+
+# How many receipt candidates the search returns, and how many distinct
+# receipt families get read into the evidence block.
+RECEIPT_CANDIDATES = 10
+MAX_RECEIPTS = 3
 
 # Search paths
 RECEIPT_DIR = Path(os.path.expanduser("~/receipts"))
@@ -67,13 +76,22 @@ def compile_context(question: str, intent: str,
     fgip_budget = int(char_budget * 0.2)
     memory_budget = int(char_budget * 0.2)
 
-    # 4. Read and extract from the best receipt match
+    # 4. Read and extract from the top receipt matches.
+    #    Files in the same family (bench_*_run17, run14, ...) are collapsed to
+    #    their newest member first, so a run series can't crowd out a
+    #    lower-scoring but distinct receipt such as phase0_receipt.json.
     if receipt_hits:
-        best = receipt_hits[0]
-        excerpt = _read_receipt_compact(best["path"], receipt_budget)
-        if excerpt:
-            evidence_parts.append(f"[Receipt: {best['name']}]\n{excerpt}")
-            sources.append(best["path"])
+        picks = _dedupe_families(receipt_hits)[:MAX_RECEIPTS]
+        remaining = receipt_budget
+        for i, hit in enumerate(picks):
+            share = remaining // (len(picks) - i)
+            excerpt = _read_receipt_compact(hit["path"], share)
+            if excerpt:
+                evidence_parts.append(f"[Receipt: {hit['name']}]\n{excerpt}")
+                sources.append(hit["path"])
+                remaining -= len(excerpt)
+            if remaining < 200:
+                break
 
     # 5. Add FGIP claims
     if fgip_hits:
@@ -96,11 +114,24 @@ def compile_context(question: str, intent: str,
     # 7. Assemble
     evidence = "\n\n".join(evidence_parts) if evidence_parts else ""
 
-    # 8. Add history summary if present
+    # 8. Add history summary if present.
+    #    history_summary is chronological (oldest turn first). When it exceeds
+    #    the cap we must keep the TAIL — the most recent turns — and drop the
+    #    oldest. Cutting at a line boundary so no half-turn leaks in.
     if history_summary:
-        # History gets added before evidence, capped
-        history_cap = min(len(history_summary), int(char_budget * 0.15))
-        evidence = f"[Prior context]\n{history_summary[:history_cap]}\n\n{evidence}"
+        history_cap = int(char_budget * 0.15)
+        kept = history_summary.rstrip("\n")
+        if len(kept) > history_cap:
+            kept = kept[-history_cap:]
+            # Resync to the start of a whole turn ("Q: ..." line) if possible,
+            # otherwise to the next line boundary.
+            cut = kept.find("\nQ: ")
+            if cut < 0:
+                cut = kept.find("\n")
+            if 0 <= cut < len(kept) - 1:
+                kept = kept[cut + 1:]
+            kept = "... (earlier turns dropped)\n" + kept
+        evidence = f"[Prior context]\n{kept}\n\n{evidence}"
 
     # Trim to budget
     if len(evidence) > char_budget:
@@ -183,8 +214,15 @@ def _search_receipts(keywords: list[str]) -> list[dict]:
         # Count keyword matches in filename
         score = sum(1 for kw in keywords if kw in name_lower)
         # Directory components score equally — phase0_receipt.json under
-        # hxq_af6_mmq_phase0/ should rank as high as a file with af6 in its name
-        dir_lower = str(f.parent).lower()
+        # hxq_af6_mmq_phase0/ should rank as high as a file with af6 in its name.
+        # Only the path *below* RECEIPT_DIR counts, so a keyword like "receipt"
+        # doesn't match "/home/.../receipts" and add +1 to every file.
+        try:
+            dir_lower = str(f.parent.relative_to(RECEIPT_DIR)).lower()
+        except ValueError:
+            dir_lower = str(f.parent).lower()
+        if dir_lower == ".":
+            dir_lower = ""
         score += sum(1 for kw in keywords if kw in dir_lower
                      and kw not in name_lower)
         if score > 0:
@@ -197,7 +235,35 @@ def _search_receipts(keywords: list[str]) -> list[dict]:
 
     # Sort by score descending, then by modification time (newest first)
     scored.sort(key=lambda x: (-x["score"], -os.path.getmtime(x["path"])))
-    return scored[:5]
+    return scored[:RECEIPT_CANDIDATES]
+
+
+_FAMILY_RUN = re.compile(r"_?run\d+", re.IGNORECASE)
+_FAMILY_TS = re.compile(r"_?\d{8}t\d{6}z?|_?\d{8}(?:[-_]\d{4,6})?", re.IGNORECASE)
+
+
+def _family_key(hit: dict) -> str:
+    """Collapse run numbers and timestamps so a series of bench runs counts
+    as one family. bench_interleaved_hxq_af6_run17_20261024T164048Z.json and
+    ..._run14_... share a key; phase0_receipt.json is its own family."""
+    stem = Path(hit["name"]).stem.lower()
+    stem = _FAMILY_RUN.sub("", stem)
+    stem = _FAMILY_TS.sub("", stem)
+    parent = str(Path(hit["path"]).parent)
+    return f"{parent}/{stem}"
+
+
+def _dedupe_families(hits: list[dict]) -> list[dict]:
+    """Keep the first (highest score, newest) member of each family, in order."""
+    seen = set()
+    out = []
+    for h in hits:
+        key = _family_key(h)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+    return out
 
 
 def _read_receipt_compact(path: str, char_budget: int) -> Optional[str]:
@@ -208,22 +274,43 @@ def _read_receipt_compact(path: str, char_budget: int) -> Optional[str]:
     except (json.JSONDecodeError, OSError):
         return None
 
-    # Handle array-format receipts (e.g., llama-bench output)
+    # Handle array-format receipts (e.g., llama-bench output).
+    # llama-bench emits one entry per test (pp512, tg128, ...). The header
+    # fields are shared, so emit them once from entry[0], then one line per
+    # entry with its test name and throughput — the tg row is the number
+    # people actually ask for and was previously dropped.
     if isinstance(data, list):
         if not data:
             return None
-        # Take first entry, extract key fields
-        entry = data[0] if isinstance(data[0], dict) else {}
+        entries = [e for e in data if isinstance(e, dict)]
+        if not entries:
+            return None
+        first = entries[0]
         parts = [f"File: {os.path.basename(path)} (array, {len(data)} entries)"]
-        bench_keys = ["gpu_info", "model_filename", "model_type", "model_size",
-                      "n_batch", "test", "n_prompt", "n_gen", "avg_ts"]
+        header_keys = ["gpu_info", "model_filename", "model_type", "model_size",
+                       "n_batch", "n_gpu_layers"]
         used = len(parts[0])
-        for k in bench_keys:
-            if k in entry:
-                line = f"{k}: {entry[k]}"
+        for k in header_keys:
+            if k in first:
+                line = f"{k}: {first[k]}"
                 if used + len(line) + 2 < char_budget:
                     parts.append(line)
                     used += len(line) + 2
+        for e in entries:
+            test = e.get("test") or f"pp{e.get('n_prompt', '?')}/tg{e.get('n_gen', '?')}"
+            avg = e.get("avg_ts")
+            std = e.get("stddev_ts")
+            if avg is None:
+                line = f"{test}: (no avg_ts)"
+            elif std is not None:
+                line = f"{test}: {avg:.2f} ± {std:.2f} t/s"
+            else:
+                line = f"{test}: {avg:.2f} t/s"
+            if used + len(line) + 2 < char_budget:
+                parts.append(line)
+                used += len(line) + 2
+            else:
+                break
         return "\n".join(parts)
 
     # Priority fields — these carry the most information
@@ -251,6 +338,11 @@ def _read_receipt_compact(path: str, char_budget: int) -> Optional[str]:
     for key, val in data.items():
         if key in priority_keys or key == "cost":
             continue
+        # Short lists of strings (baselines, formats, tags) are cheap and
+        # often the exact thing being asked for; previously dropped.
+        if (isinstance(val, list) and 0 < len(val) <= 10
+                and all(isinstance(x, str) for x in val)):
+            val = ", ".join(val)
         if isinstance(val, (str, int, float, bool)) and val:
             line = f"{key}: {val}"
             if len(line) > 200:
@@ -298,6 +390,11 @@ def _format_value(key: str, val) -> str:
         return f"{key}: {s}"
 
 
+def _fts_quote(term: str) -> str:
+    """Quote a term for an FTS5 MATCH expression (doubling embedded quotes)."""
+    return '"' + term.replace('"', '""') + '"'
+
+
 def _search_fgip(keywords: list[str]) -> list[dict]:
     """Search FGIP claims via FTS5."""
     if not os.path.exists(FGIP_DB):
@@ -311,7 +408,11 @@ def _search_fgip(keywords: list[str]) -> list[dict]:
                   "kernel", "output", "input", "config", "path", "file"}
     domain_kw = [kw for kw in keywords[:8]
                  if kw not in fgip_noise and re.match(r'^[a-zA-Z0-9_.\-]+$', kw)]
-    fts_query = " OR ".join(domain_kw)
+    # FTS5 barewords may not contain '.' or '-' ('-' is NOT, '.' is not a
+    # token char), so "qwen2.5-coder OR af6" is a syntax error that the
+    # except below would swallow silently. Quote every term; FTS5 then
+    # tokenizes the quoted string as a phrase.
+    fts_query = " OR ".join(_fts_quote(kw) for kw in domain_kw)
     if not fts_query:
         return []
 
@@ -328,7 +429,12 @@ def _search_fgip(keywords: list[str]) -> list[dict]:
             results.append({"text": text[:200], "rowid": d.get("rowid")})
         conn.close()
         return results
-    except Exception:
+    except Exception as e:
+        # Fail open (graph context is optional) but don't fail silently:
+        # a malformed MATCH expression looked exactly like "no hits" before.
+        if os.environ.get("CELL_DEBUG"):
+            print(f"[context_compiler] fgip search failed: {e!r} "
+                  f"query={fts_query!r}", file=sys.stderr)
         return []
 
 
