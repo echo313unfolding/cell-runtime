@@ -30,9 +30,21 @@ from cell.tool_registry import (
 from cell.memory_lane import MemoryLane
 from cell.specialists import create_specialist_registry, find_specialist
 from cell.ask_pass import ask_pass
+from cell.context_compiler import compile_context, summarize_turn
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 MAX_TOOL_TURNS = 5
+
+# Tools injected per intent when use_tools=True.
+# Keeps prompt small — only what the model needs for this query type.
+INTENT_TOOLS = {
+    "coding": ["read_file", "grep", "list_dir", "shell"],
+    "security_triage": ["read_file", "grep", "list_dir", "shell",
+                        "sentinel_triage", "rag_lookup"],
+    "general": ["read_file", "grep", "list_dir", "memory_search"],
+    "reasoning": ["read_file", "memory_search", "rag_lookup"],
+    "hybrid_experiment": ["read_file", "grep", "list_dir", "memory_search"],
+}
 
 
 class Orchestrator:
@@ -85,6 +97,22 @@ class Orchestrator:
             log_cfg.get("task_dir", "~/receipts/cell/tasks/")))
         self.swap_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.task_dir.mkdir(parents=True, exist_ok=True)
+
+    def _lean_registry(self, intent: str) -> ToolRegistry:
+        """Build a lean tool registry containing only tools relevant to this intent."""
+        tool_names = INTENT_TOOLS.get(intent, INTENT_TOOLS["general"])
+        lean = ToolRegistry()
+        for name in tool_names:
+            if name in self.tool_registry._tools:
+                info = self.tool_registry._tools[name]
+                lean.register(name, info["handler"], info["description"],
+                              info["args_schema"])
+        # Always include delegate_to_host as escape hatch
+        if "delegate_to_host" in self.tool_registry._tools:
+            info = self.tool_registry._tools["delegate_to_host"]
+            lean.register("delegate_to_host", info["handler"],
+                          info["description"], info["args_schema"])
+        return lean
 
     def _should_swap(self, current: str | None, target: str, intent: str) -> bool:
         """Decide whether to swap models based on policy."""
@@ -141,18 +169,21 @@ class Orchestrator:
         }
 
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
-                  history: list = None) -> dict:
+                  history: list = None, tool_registry: ToolRegistry = None) -> dict:
         """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
 
         Args:
             history: Optional list of prior {"role": ..., "content": ...} messages
                      for multi-turn chat. Inserted between system prompt and current user turn.
+            tool_registry: Optional override registry (for selective tool loading).
+                           Defaults to self.tool_registry.
         """
+        active_registry = tool_registry or self.tool_registry
         backend = self._backend_for(model)
         system_prompt = self.roster.get(model, {}).get(
             "system_prompt", "You are a helpful assistant.")
         if use_tools:
-            system_prompt += self.tool_registry.format_for_prompt()
+            system_prompt += active_registry.format_for_prompt()
 
         messages = [{"role": "system", "content": system_prompt}]
         if history:
@@ -238,7 +269,7 @@ class Orchestrator:
                     })
                     continue
 
-                tool_result = self.tool_registry.execute(tool_name, tool_args)
+                tool_result = active_registry.execute(tool_name, tool_args)
                 tool_calls_log.append({
                     "name": tool_name,
                     "arguments": tool_args,
@@ -415,15 +446,42 @@ class Orchestrator:
                 # Specialist not available — fall through to generic path
                 pass
 
-        # 7. Generic path: inject memory capsule and generate
-        capsule_ctx = self.memory.get_capsule_prompt()
-        augmented_input = user_input
-        if capsule_ctx:
-            augmented_input = user_input + capsule_ctx
+        # 7. Compile context on CPU — search receipts, graph, memory
+        history_summary = ""
+        if history:
+            # Compress prior turns into a compact summary
+            for i in range(0, len(history) - 1, 2):
+                if (history[i].get("role") == "user" and
+                        i + 1 < len(history) and
+                        history[i + 1].get("role") == "assistant"):
+                    turn_sum = summarize_turn(
+                        history[i]["content"],
+                        history[i + 1]["content"],
+                    )
+                    if turn_sum:
+                        history_summary += turn_sum + "\n"
 
-        # 8. Generate (with optional tool loop + conversation history)
+        compiled = compile_context(
+            user_input, intent,
+            history_summary=history_summary,
+            token_budget=1200,
+        )
+
+        # Build augmented input: question + compiled evidence
+        augmented_input = user_input
+        if compiled["evidence"]:
+            augmented_input = (
+                f"{user_input}\n\n"
+                f"--- Evidence (retrieved from local files) ---\n"
+                f"{compiled['evidence']}\n"
+                f"--- End evidence ---"
+            )
+
+        # 8. Generate (with optional tool loop, lean registry, compressed history)
+        lean_reg = self._lean_registry(intent) if use_tools else None
+        # Don't pass raw history — it's already compressed into the evidence block
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
-                                    history=history)
+                                    tool_registry=lean_reg)
 
         # 9. Feed result to memory lane
         self.memory.ingest({
@@ -468,6 +526,11 @@ class Orchestrator:
             "total_duration_ns": gen_result.get("total_duration", 0),
         }
         task_dict["specialist_adapter_used"] = False
+        task_dict["context_compiled"] = {
+            "tokens_est": compiled["tokens_est"],
+            "sources": compiled["sources"],
+            "searches": compiled["searches"],
+        }
         if tool_calls:
             task_dict["tool_calls"] = tool_calls
         if escalations:
@@ -494,6 +557,11 @@ class Orchestrator:
             "tool_calls": len(tool_calls),
             "receipt": str(task_path),
             "memory_turn": self.memory.state.get("turn_count", 0),
+            "context_compiled": {
+                "tokens_est": compiled["tokens_est"],
+                "sources": compiled["sources"],
+                "searches": compiled["searches"],
+            },
         }
         if escalations:
             result["escalations"] = escalations
