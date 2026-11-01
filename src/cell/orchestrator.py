@@ -687,15 +687,17 @@ class Orchestrator:
             # "memory" and "fgip.db" to sources but those aren't answers
             # to the question — only receipt excerpts are.
             #
-            # No intent exemption: the v6 A/B showed the coding scenario
-            # works fine without tools when receipts are present, and the
-            # regex classifier false-positives on receipt questions
-            # containing words like "for" or "binary" (af6_bench T1).
+            # Coding exempt: "fix this file" needs read_file/grep/shell
+            # even when a receipt filename coincidentally matches a word
+            # in the question ("fixture" → wp_runtime_001_fixture.json).
+            # The classifier's code-keyword regexes are tightened (0007)
+            # so receipt questions no longer false-positive as coding.
             receipt_sources = [s for s in compiled["sources"]
                                if s not in ("memory", "fgip.db")]
             evidence_present = bool(receipt_sources)
             if (use_tools and evidence_present
-                    and self.tools_when_evidence == "off"):
+                    and self.tools_when_evidence == "off"
+                    and intent != "coding"):
                 use_tools = False
 
             # Build augmented input: evidence FIRST, then question.
