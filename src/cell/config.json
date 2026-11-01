@@ -17,6 +17,11 @@
     "enabled": true,
     "llm_enhanced": false
   },
+  "context_compiler": {
+    "enabled": true,
+    "token_budget": 1200,
+    "tools_when_evidence": "off"
+  },
   "default_model": "qwen2.5-coder",
   "swap_policy": "sticky",
   "generation": {

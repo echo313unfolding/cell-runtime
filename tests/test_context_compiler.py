@@ -193,7 +193,8 @@ def orch_config(tmp_path):
 
 
 def _stub_generate(captured):
-    def fake(self, model, user_input, use_tools=False, history=None, tool_registry=None):
+    def fake(self, model, user_input, use_tools=False, history=None,
+             tool_registry=None, **kwargs):
         captured.update(dict(user_input=user_input, history=history,
                              registry_size=len(tool_registry._tools) if tool_registry else None))
         return {"content": "ok", "eval_count": 1, "eval_duration": 1,

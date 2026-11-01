@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import statistics
 import json
 import os
 import signal
@@ -234,15 +235,28 @@ def _start_server(config: dict, model: str,
 # ---------------------------------------------------------------------------
 def run_mode(mode: str, config_path: str, scenarios: list[dict],
              use_tools: bool, depth: int) -> list[dict]:
+    # ── Set env vars for this mode ──
     # compiler<N> = compiler with N-token evidence budget
+    # compiler_notools = suppress tools when evidence present
+    # compiler_syshint = hint in system prompt
+    # All compiler* modes enable the compiler; anything else is legacy.
+    for v in ("CELL_CONTEXT_BUDGET", "CELL_TOOLS_WHEN_EVIDENCE",
+              "CELL_HINT_IN_SYSTEM"):
+        os.environ.pop(v, None)
+
     if mode.startswith("compiler"):
         os.environ["CELL_CONTEXT_COMPILER"] = "1"
         if mode == "compiler600":
             os.environ["CELL_CONTEXT_BUDGET"] = "600"
+        elif mode == "compiler2000":
+            os.environ["CELL_CONTEXT_BUDGET"] = "2000"
         elif mode == "compiler3000":
             os.environ["CELL_CONTEXT_BUDGET"] = "3000"
-        elif "CELL_CONTEXT_BUDGET" in os.environ:
-            del os.environ["CELL_CONTEXT_BUDGET"]
+
+        if mode == "compiler_notools":
+            os.environ["CELL_TOOLS_WHEN_EVIDENCE"] = "off"
+        if mode == "compiler_syshint":
+            os.environ["CELL_HINT_IN_SYSTEM"] = "1"
     else:
         os.environ["CELL_CONTEXT_COMPILER"] = "0"
     from cell.orchestrator import Orchestrator  # import after env set is fine; flag read in __init__
@@ -254,8 +268,24 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
         orch.pool._llama_current_model = model
     n_ctx = int(orch.gen_opts.get("num_ctx", 4096))
 
+    # Helper: evict llama-server's single prompt-cache slot between
+    # scenarios so T1 cache numbers aren't inflated by cross-scenario
+    # prefix matches.  A 1-token completion with a unique prompt is
+    # enough to overwrite the slot.
+    def _evict_slot():
+        url = orch.config.get("llama_server_url", "http://localhost:8080")
+        nonce = f"cache_bust_{time.time_ns()}"
+        try:
+            orch.pool._http(f"{url}/v1/chat/completions", {
+                "messages": [{"role": "user", "content": nonce}],
+                "max_tokens": 1, "temperature": 0,
+            }, timeout=10)
+        except Exception:
+            pass
+
     rows = []
     for sc in scenarios:
+        _evict_slot()
         orch.reset_session() if hasattr(orch, "reset_session") else orch.memory.reset()
         history: list[dict] = []
         skip = False
@@ -372,10 +402,20 @@ def summarize(rows: list[dict]) -> dict:
                 for t in sorted({r["turn"] for r in measured})
             } if measured else {},
             "mean_prompt_ms": round(sum(r["prompt_ms"] for r in rs) / len(rs), 1),
+            "mean_prompt_ms_t2t3": round(
+                sum(r["prompt_ms"] for r in rs if r["turn"] >= 2)
+                / max(1, sum(1 for r in rs if r["turn"] >= 2)), 1),
             "mean_headroom": round(
                 sum(r["headroom"] for r in measured) / len(measured), 1) if measured else None,
             "min_headroom": min((r["headroom"] for r in measured), default=None),
             "mean_wall_s": round(sum(r["wall_s"] for r in rs) / len(rs), 2),
+            "median_wall_s": round(statistics.median(r["wall_s"] for r in rs), 2),
+            "mean_wall_s_by_turn": {
+                f"T{t}": round(
+                    sum(r["wall_s"] for r in rs if r["turn"] == t)
+                    / max(1, sum(1 for r in rs if r["turn"] == t)), 2)
+                for t in sorted({r["turn"] for r in rs})
+            },
             "mean_tool_calls": round(sum(r["tool_calls"] for r in rs) / len(rs), 2),
             "turn3_degenerate": sum(1 for r in rs if r["turn"] == 3 and r["degenerate"]),
             "context_ceiling_hits": sum(1 for r in rs if r.get("context_ceiling_hit")),
@@ -396,7 +436,9 @@ def main():
                     help="launch llama-server from config; killed on exit")
     ap.add_argument("--llama-args", default="",
                     help="extra args passed to llama-server (e.g. '--cache-reuse 256')")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v5_<ts>.json)")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="run each mode N times for noise measurement (default 1)")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v6_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -421,9 +463,17 @@ def main():
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     rows: list[dict] = []
     try:
-        for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
-            rows.extend(run_mode(mode, args.config, scenarios,
-                                 use_tools=(args.tools == "on"), depth=args.depth))
+        modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+        for rep in range(args.repeat):
+            for mode in modes:
+                run_label = f"{mode}" if args.repeat == 1 else f"{mode}_r{rep + 1}"
+                run_rows = run_mode(mode, args.config, scenarios,
+                                    use_tools=(args.tools == "on"), depth=args.depth)
+                # Tag each row with the run label for noise analysis
+                for r in run_rows:
+                    r["run"] = rep + 1
+                    r["mode_label"] = run_label
+                rows.extend(run_rows)
     finally:
         if proc is not None:
             try:
@@ -433,8 +483,8 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v5_{stamp}",
-        "title": "Context compiler A/B — legacy vs compiler on the same orchestrator/binary/model",
+        "receipt_id": f"echo_context_compiler_ab_v6_{stamp}",
+        "title": "Context compiler A/B v6 — tool-loop ablation and hint placement",
         "timestamp": stamp,
         "config": args.config,
         "llama_server_url": url,
@@ -443,6 +493,7 @@ def main():
         "num_predict": config.get("generation", {}).get("num_predict"),
         "use_tools": args.tools == "on",
         "depth": args.depth,
+        "repeat": args.repeat,
         "scenarios": [{"id": s["id"], "gold": s["gold"], "n_turns": len(s["turns"])} for s in scenarios],
         "metric_definitions": {
             "first_prompt_tokens": "usage.prompt_tokens of the first call in the turn = FULL context the model saw (counts against n_ctx)",
@@ -469,19 +520,22 @@ def main():
             "mean_first_prompt_tokens", "mean_max_prompt_tokens", "max_prompt_tokens",
             "mean_prompt_cached_frac", "cached_frac_by_turn",
             "mean_headroom", "min_headroom",
-            "mean_prompt_ms", "mean_wall_s", "mean_tool_calls"]
+            "mean_prompt_ms", "mean_prompt_ms_t2t3",
+            "mean_wall_s", "median_wall_s", "mean_wall_s_by_turn", "mean_tool_calls"]
     modes = list(summary)
-    print(f"{'metric':26s}" + "".join(f"{m:>14s}" for m in modes))
+    col_w = max(16, max(len(m) for m in modes) + 2) if modes else 16
+    print(f"{'metric':30s}" + "".join(f"{m:>{col_w}s}" for m in modes))
     for k in keys:
-        if k == "cached_frac_by_turn":
-            # Expand per-turn cache fractions into separate rows
+        if k in ("cached_frac_by_turn", "mean_wall_s_by_turn"):
+            # Expand per-turn dicts into separate rows
             all_turns = sorted({t for m in modes for t in summary[m].get(k, {})})
+            prefix = "  cached_frac_" if "cached" in k else "  wall_s_"
             for t in all_turns:
-                label = f"  cached_frac_{t}"
-                print(f"{label:26s}" + "".join(
-                    f"{str(summary[m].get(k, {}).get(t, '')):>14s}" for m in modes))
+                label = f"{prefix}{t}"
+                print(f"{label:30s}" + "".join(
+                    f"{str(summary[m].get(k, {}).get(t, '')):>{col_w}s}" for m in modes))
         else:
-            print(f"{k:26s}" + "".join(f"{str(summary[m][k]):>14s}" for m in modes))
+            print(f"{k:30s}" + "".join(f"{str(summary[m][k]):>{col_w}s}" for m in modes))
     print(f"\nreceipt: {out}")
 
 

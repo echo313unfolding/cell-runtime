@@ -78,6 +78,19 @@ class Orchestrator:
         self.context_token_budget = int(
             os.environ.get("CELL_CONTEXT_BUDGET", ctx_cfg.get("token_budget", 1200)))
 
+        # v6 A/B controls. Config sets the default; env var overrides for
+        # harness A/B runs.
+        #   tools_when_evidence: "off" suppresses the tool loop when the
+        #       compiler found receipt evidence. v6 receipt proved this
+        #       cuts wall time 42% with zero retrieval loss.
+        #   CELL_HINT_IN_SYSTEM=1: put the "evidence was retrieved" hint
+        #       in the system prompt (experimental; caused degeneration).
+        self.tools_when_evidence = os.environ.get(
+            "CELL_TOOLS_WHEN_EVIDENCE",
+            ctx_cfg.get("tools_when_evidence", "on")).strip().lower()
+        self.hint_in_system = os.environ.get(
+            "CELL_HINT_IN_SYSTEM", "0").strip().lower() in ("1", "true", "on")
+
         self.tool_registry = create_default_registry()
 
         # Wire agents to orchestrator if available
@@ -234,7 +247,8 @@ class Orchestrator:
             return int(len(text) / 2.5)
 
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
-                  history: list = None, tool_registry: ToolRegistry = None) -> dict:
+                  history: list = None, tool_registry: ToolRegistry = None,
+                  system_hint: str = "") -> dict:
         """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
 
         Args:
@@ -242,11 +256,14 @@ class Orchestrator:
                      for multi-turn chat. Inserted between system prompt and current user turn.
             tool_registry: Optional override registry (for selective tool loading).
                            Defaults to self.tool_registry.
+            system_hint: Extra text appended to the system prompt (e.g., evidence hint).
         """
         active_registry = tool_registry or self.tool_registry
         backend = self._backend_for(model)
         system_prompt = self.roster.get(model, {}).get(
             "system_prompt", "You are a helpful assistant.")
+        if system_hint:
+            system_prompt += system_hint
         if use_tools:
             system_prompt += active_registry.format_for_prompt()
 
@@ -662,14 +679,33 @@ class Orchestrator:
             )
             self._prior_excerpts = compiled.get("excerpts", [])
 
+            # v6: suppress tool loop when receipt evidence is present
+            # (CELL_TOOLS_WHEN_EVIDENCE=off).
+            #
+            # evidence_present means the compiler found actual receipt
+            # excerpts, not just memory or FGIP hits. Memory/FGIP add
+            # "memory" and "fgip.db" to sources but those aren't answers
+            # to the question — only receipt excerpts are.
+            #
+            # No intent exemption: the v6 A/B showed the coding scenario
+            # works fine without tools when receipts are present, and the
+            # regex classifier false-positives on receipt questions
+            # containing words like "for" or "binary" (af6_bench T1).
+            receipt_sources = [s for s in compiled["sources"]
+                               if s not in ("memory", "fgip.db")]
+            evidence_present = bool(receipt_sources)
+            if (use_tools and evidence_present
+                    and self.tools_when_evidence == "off"):
+                use_tools = False
+
             # Build augmented input: evidence FIRST, then question.
             # Evidence goes at the front so the carried excerpts form a
             # byte-stable prefix across T2/T3, letting llama-server's
             # prompt cache cover them.
             augmented_input = user_input
+            hint = ""
             if compiled["evidence"]:
-                hint = ""
-                if use_tools and compiled["sources"]:
+                if use_tools and evidence_present and not self.hint_in_system:
                     hint = ("\nEvidence above was retrieved for you; "
                             "call tools only if it is insufficient.\n")
                 augmented_input = (
@@ -681,14 +717,24 @@ class Orchestrator:
             active_reg = self._lean_registry(intent) if use_tools else None
             # Raw history is NOT passed — it's compressed into the evidence block
         else:
+            evidence_present = False
             capsule_ctx = self.memory.get_capsule_prompt()
             augmented_input = user_input + capsule_ctx if capsule_ctx else user_input
             active_reg = None            # _generate falls back to the full registry
             gen_history = history
 
         # 8. Generate (with optional tool loop)
+        # When hint_in_system is on, the hint goes into the system prompt
+        # instead of the user turn (v6 arm: measure whether system-prompt
+        # placement reduces unnecessary tool calls).
+        sys_hint = ""
+        if self.hint_in_system and evidence_present and context_mode == "compiler":
+            sys_hint = ("\nWhen evidence is provided in the user message, "
+                        "use it directly. Only call tools if the evidence "
+                        "is clearly insufficient.")
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
-                                    history=gen_history, tool_registry=active_reg)
+                                    history=gen_history, tool_registry=active_reg,
+                                    system_hint=sys_hint)
 
         # 9. Feed result to memory lane
         self.memory.ingest({
