@@ -198,7 +198,8 @@ def _stub_generate(captured):
                              registry_size=len(tool_registry._tools) if tool_registry else None))
         return {"content": "ok", "eval_count": 1, "eval_duration": 1,
                 "prompt_tokens": 7, "first_prompt_tokens": 7,
-                "timings_measured": True, "tool_calls": []}
+                "timings_measured": True, "tool_calls": [],
+                "context_ceiling_hit": False, "stagnation": False}
     return fake
 
 
@@ -333,3 +334,190 @@ def test_orchestrator_threads_prior_sources_across_turns(orch_config, monkeypatc
 
     o.reset_session()
     assert o._prior_sources == []
+
+
+# ---------------------------------------------------------------------------
+# 7. tool-loop guards: context ceiling & stagnation
+# ---------------------------------------------------------------------------
+def _make_tool_loop_orch(orch_config, monkeypatch, responses):
+    """Set up an Orchestrator whose _openai_chat returns canned responses
+    in sequence.  Each response is a dict with at least 'content'.
+    Tokens are set in usage so ceiling math works.
+    """
+    from cell.orchestrator import Orchestrator
+    monkeypatch.setenv("CELL_CONTEXT_COMPILER", "1")
+    o = Orchestrator(orch_config)
+    o.pool._llama_current_model = "m"
+    monkeypatch.setattr(o.pool, "_llama_server_alive", lambda: True)
+
+    call_idx = [0]
+    def fake_http(url, payload, timeout=0):
+        idx = call_idx[0]
+        call_idx[0] += 1
+        resp = responses[min(idx, len(responses) - 1)]
+        pt = resp.get("prompt_tokens", 100)
+        ev = resp.get("eval_tokens", 10)
+        return {
+            "choices": [{"message": {"content": resp["content"]}}],
+            "usage": {"prompt_tokens": pt, "completion_tokens": ev},
+            "timings": {"prompt_n": pt, "predicted_n": ev,
+                        "prompt_ms": 10.0, "predicted_ms": 50.0},
+        }
+    monkeypatch.setattr(o.pool, "_http", fake_http)
+
+    # Stub _tokenize to use char/2.5 (no real server)
+    monkeypatch.setattr(o, "_tokenize", lambda text: int(len(text) / 2.5))
+
+    return o
+
+
+def test_stagnation_repeated_call_triggers_force_commit(orch_config, monkeypatch):
+    """When the model calls the same tool with the same args twice, _generate
+    should force-commit instead of looping."""
+    tool_call = '```tool_call\n{"name": "grep", "arguments": {"pattern": "af6", "path": "/tmp"}}\n```'
+    responses = [
+        # Turn 0: model emits a tool call
+        {"content": tool_call, "prompt_tokens": 500, "eval_tokens": 20},
+        # Turn 1: model emits the SAME tool call again (stagnation)
+        {"content": tool_call, "prompt_tokens": 700, "eval_tokens": 20},
+        # Turn 2: force-commit answer call
+        {"content": "The AF6 benchmark showed good results.", "prompt_tokens": 750, "eval_tokens": 30},
+    ]
+    o = _make_tool_loop_orch(orch_config, monkeypatch, responses)
+    # Need a tool registry that can execute "grep"
+    from cell.tool_registry import ToolRegistry
+    reg = ToolRegistry()
+    reg.register("grep", lambda pattern="", path="": "some grep result", "search files")
+    result = o._generate("m", "test query", use_tools=True, tool_registry=reg)
+    assert result["stagnation"] is True
+    assert result["force_commit"] == "stagnation_repeated_call"
+    # The final content should be the force-commit answer, not the tool fence
+    assert "AF6" in result["content"] or "context" in result["content"].lower()
+
+
+def test_no_new_info_repeated_result_triggers_force_commit(orch_config, monkeypatch):
+    """When two different tool calls return identical results, that's no-new-info."""
+    call_a = '```tool_call\n{"name": "grep", "arguments": {"pattern": "af6", "path": "/a"}}\n```'
+    call_b = '```tool_call\n{"name": "grep", "arguments": {"pattern": "af6", "path": "/b"}}\n```'
+    responses = [
+        {"content": call_a, "prompt_tokens": 500, "eval_tokens": 20},
+        {"content": call_b, "prompt_tokens": 700, "eval_tokens": 20},
+        # force-commit answer
+        {"content": "Based on available data, the results are...", "prompt_tokens": 750, "eval_tokens": 30},
+    ]
+    o = _make_tool_loop_orch(orch_config, monkeypatch, responses)
+    from cell.tool_registry import ToolRegistry
+    reg = ToolRegistry()
+    # Both calls return the exact same result → no_new_info (must be ≥40 chars)
+    reg.register("grep", lambda pattern="", path="": "identical result text that is long enough to trigger the hash check", "search files")
+    result = o._generate("m", "test query", use_tools=True, tool_registry=reg)
+    assert result["stagnation"] is True
+    assert "no_new_info" in result["force_commit"]
+
+
+def test_context_ceiling_truncates_result(orch_config, monkeypatch):
+    """When a tool result would push past n_ctx, it gets truncated."""
+    tool_call = '```tool_call\n{"name": "read_file", "arguments": {"path": "/tmp/big.json"}}\n```'
+    responses = [
+        # First call reports high prompt usage, leaving little room
+        {"content": tool_call, "prompt_tokens": 3500, "eval_tokens": 20},
+        # After truncated result is appended, model answers
+        {"content": "The file contained benchmark data.", "prompt_tokens": 3700, "eval_tokens": 30},
+    ]
+    o = _make_tool_loop_orch(orch_config, monkeypatch, responses)
+    from cell.tool_registry import ToolRegistry
+    reg = ToolRegistry()
+    # Return a huge result that would overflow n_ctx=4096
+    reg.register("read_file", lambda path="": "x" * 5000, "read a file")
+    result = o._generate("m", "read big file", use_tools=True, tool_registry=reg)
+    # Should NOT have errored out — the result was truncated to fit
+    assert result["content"] == "The file contained benchmark data."
+    # Check the logged tool result was capped
+    logged = result["tool_calls"][0]["result"]
+    assert len(logged) <= 2000
+
+
+def test_context_ceiling_force_commit_when_no_room(orch_config, monkeypatch):
+    """When there's no room even for a truncated result, force-commit fires."""
+    tool_call = '```tool_call\n{"name": "read_file", "arguments": {"path": "/tmp/big.json"}}\n```'
+    responses = [
+        # Almost full context — only ~100 tokens left
+        {"content": tool_call, "prompt_tokens": 3900, "eval_tokens": 20},
+        # force-commit answer
+        {"content": "I cannot read more files.", "prompt_tokens": 3950, "eval_tokens": 15},
+    ]
+    o = _make_tool_loop_orch(orch_config, monkeypatch, responses)
+    from cell.tool_registry import ToolRegistry
+    reg = ToolRegistry()
+    reg.register("read_file", lambda path="": "x" * 3000, "read a file")
+    result = o._generate("m", "read big file", use_tools=True, tool_registry=reg)
+    assert result["context_ceiling_hit"] is True
+    assert "ceiling" in result.get("force_commit", "")
+
+
+def test_multi_call_fence_ceiling_catches_accumulated_results(orch_config, monkeypatch):
+    """Three tool calls in one assistant turn, each returning 1200 chars.
+    Starting at pt=3300, the ceiling must fire before all three are appended.
+    n_ctx=4096 - margin(128) = 3968 usable. pt=3300 + fence(~30) + 3*480tok
+    would be ~4770 — the loop must truncate or force-commit before that."""
+    three_calls = (
+        '```tool_call\n{"name": "read_file", "arguments": {"path": "/a"}}\n```\n'
+        '```tool_call\n{"name": "read_file", "arguments": {"path": "/b"}}\n```\n'
+        '```tool_call\n{"name": "read_file", "arguments": {"path": "/c"}}\n```'
+    )
+    responses = [
+        # Model emits 3 tool calls at once, context already at 3300
+        {"content": three_calls, "prompt_tokens": 3300, "eval_tokens": 50},
+        # Force-commit answer (if ceiling fires)
+        {"content": "Here is a summary from the files.", "prompt_tokens": 3500, "eval_tokens": 30},
+    ]
+    o = _make_tool_loop_orch(orch_config, monkeypatch, responses)
+    from cell.tool_registry import ToolRegistry
+    reg = ToolRegistry()
+    # Each call returns DIFFERENT content so no-new-info doesn't fire first
+    call_counter = [0]
+    def read_file_handler(path=""):
+        call_counter[0] += 1
+        return chr(64 + call_counter[0]) * 1200   # "AAA...", "BBB...", "CCC..."
+    reg.register("read_file", read_file_handler, "read a file")
+    result = o._generate("m", "read three files", use_tools=True, tool_registry=reg)
+    # The loop must have hit the ceiling — 3300 + fence + 3×480 > 4096-128
+    assert result["context_ceiling_hit"] is True
+    assert "ceiling" in result.get("force_commit", "")
+
+
+def test_short_result_no_new_info_not_triggered(orch_config, monkeypatch):
+    """Short identical results (empty grep, empty dir) should NOT trigger
+    no-new-info — call-hash stagnation covers true loops."""
+    call_a = '```tool_call\n{"name": "grep", "arguments": {"pattern": "xyz", "path": "/a"}}\n```'
+    call_b = '```tool_call\n{"name": "grep", "arguments": {"pattern": "xyz", "path": "/b"}}\n```'
+    responses = [
+        {"content": call_a, "prompt_tokens": 500, "eval_tokens": 20},
+        {"content": call_b, "prompt_tokens": 700, "eval_tokens": 20},
+        # Model answers normally (no force-commit)
+        {"content": "No matches found in either directory.", "prompt_tokens": 800, "eval_tokens": 25},
+    ]
+    o = _make_tool_loop_orch(orch_config, monkeypatch, responses)
+    from cell.tool_registry import ToolRegistry
+    reg = ToolRegistry()
+    # Short result — "no matches" (< 40 chars)
+    reg.register("grep", lambda pattern="", path="": "no matches", "search files")
+    result = o._generate("m", "search both dirs", use_tools=True, tool_registry=reg)
+    # Should NOT have triggered stagnation — results are short
+    assert result["stagnation"] is False
+    assert result["content"] == "No matches found in either directory."
+
+
+def test_evidence_hint_appended_when_compiler_has_sources(orch_config, monkeypatch, receipts):
+    """When context compiler delivers evidence, the augmented input includes
+    a hint telling the model not to re-search."""
+    from cell.orchestrator import Orchestrator
+    monkeypatch.setenv("CELL_CONTEXT_COMPILER", "1")
+    captured = {}
+    monkeypatch.setattr(Orchestrator, "_generate", _stub_generate(captured))
+    o = Orchestrator(orch_config)
+    o.pool._llama_current_model = "m"
+    monkeypatch.setattr(o.pool, "_llama_server_alive", lambda: True)
+    res = o.process("hxq af6 benchmark quadro t2000", force_model="m", use_tools=True)
+    assert "Evidence above was retrieved for you" in captured["user_input"]
+    assert "call tools only if" in captured["user_input"]

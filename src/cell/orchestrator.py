@@ -11,6 +11,7 @@ Usage:
     python3 orchestrator.py --json "query"
     echo "explain quicksort" | python3 orchestrator.py
 """
+import hashlib
 import json
 import os
 import platform
@@ -34,6 +35,12 @@ from cell.context_compiler import compile_context, summarize_turn
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 MAX_TOOL_TURNS = 5
+CONTEXT_MARGIN = 128          # tokens reserved beyond num_predict
+TOOL_RESULT_CAP = 1200        # max chars per tool result (down from 3000)
+FORCE_COMMIT_MSG = (
+    "You have gathered enough information. Answer the original question now "
+    "from what you have. Do not call any more tools."
+)
 
 # Tools injected per intent when use_tools=True.
 # Keeps prompt small — only what the model needs for this query type.
@@ -210,6 +217,18 @@ class Orchestrator:
             "predicted_ms": timings.get("predicted_ms", 0.0),
         }
 
+    def _tokenize(self, text: str) -> int:
+        """Count tokens via llama-server /tokenize. Falls back to len/2.5."""
+        base_url = self.config.get("llama_server_url", "http://localhost:8080")
+        try:
+            data = self.pool._http(
+                f"{base_url}/tokenize",
+                {"content": text}, timeout=5)
+            tokens = data.get("tokens", [])
+            return len(tokens) if isinstance(tokens, list) else int(tokens)
+        except Exception:
+            return int(len(text) / 2.5)
+
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
                   history: list = None, tool_registry: ToolRegistry = None) -> dict:
         """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
@@ -237,6 +256,9 @@ class Orchestrator:
             "num_predict": self.gen_opts.get("num_predict", 1024),
         }
 
+        n_ctx = opts["num_ctx"]
+        num_predict = opts["num_predict"]
+
         total_eval_count = 0
         total_eval_duration = 0
         total_prompt_tokens = 0
@@ -247,6 +269,10 @@ class Orchestrator:
         timings_measured = False
         tool_calls_log = []
         data = None
+        context_ceiling_hit = False
+        stagnation_hit = False
+        seen_call_hashes = set()     # (tool_name, sorted_args) → stagnation
+        seen_result_hashes = set()   # result hash → no-new-info
 
         def _result(content: str, **extra) -> dict:
             out = {
@@ -267,19 +293,25 @@ class Orchestrator:
                 "prompt_ms": round(total_prompt_ms, 1),
                 "timings_measured": timings_measured,
                 "tool_calls": tool_calls_log,
+                "context_ceiling_hit": context_ceiling_hit,
+                "stagnation": stagnation_hit,
             }
             out.update(extra)
             return out
 
-        for turn in range(MAX_TOOL_TURNS if use_tools else 1):
+        def _count_tokens(text: str) -> int:
+            """Token count via /tokenize, or conservative char estimate."""
+            if backend == "llama-server":
+                return self._tokenize(text)
+            return int(len(text) / 2.5)
+
+        def _record_call(hx_or_data):
+            """Update running accumulators after an _openai_chat or ollama call."""
+            nonlocal total_eval_count, total_eval_duration, total_prompt_tokens
+            nonlocal total_prompt_ms, first_prompt_tokens, first_prompt_evaluated
+            nonlocal max_prompt_tokens, timings_measured, data
             if backend in ("helix", "llama-server"):
-                base_url = (self.config.get("llama_server_url", "http://localhost:8080")
-                            if backend == "llama-server"
-                            else self.config.get("helix_url", "http://localhost:8001"))
-                hx = self._openai_chat(base_url,
-                                       messages, max_tokens=opts["num_predict"],
-                                       temperature=opts["temperature"])
-                content = hx["content"]
+                hx = hx_or_data
                 total_eval_count += hx["eval_count"]
                 total_prompt_tokens += hx.get("prompt_tokens", 0)
                 max_prompt_tokens = max(max_prompt_tokens, hx.get("prompt_tokens", 0))
@@ -287,7 +319,6 @@ class Orchestrator:
                     first_prompt_tokens = hx.get("prompt_tokens", 0)
                     first_prompt_evaluated = hx.get("prompt_evaluated", first_prompt_tokens)
                 if hx.get("predicted_ms"):
-                    # Real wall-clock from llama-server timings
                     total_eval_duration += int(hx["predicted_ms"] * 1e6)
                     total_prompt_ms += hx.get("prompt_ms", 0.0)
                     timings_measured = True
@@ -296,17 +327,56 @@ class Orchestrator:
                     est_dur_ns = int(hx["eval_count"] / rated_toks * 1e9) if rated_toks else 0
                     total_eval_duration += est_dur_ns
             else:
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                    "stream": False,
-                    "options": opts,
-                }
-                data = self.pool._api("api/chat", payload, timeout=300)
-                msg = data.get("message", {})
-                content = msg.get("content", "")
+                data = hx_or_data
                 total_eval_count += data.get("eval_count", 0)
                 total_eval_duration += data.get("eval_duration", 0)
+
+        def _call_model(msgs, max_tok=None):
+            """Single model call through appropriate backend. Returns content string."""
+            if max_tok is None:
+                max_tok = num_predict
+            if backend in ("helix", "llama-server"):
+                base_url = (self.config.get("llama_server_url", "http://localhost:8080")
+                            if backend == "llama-server"
+                            else self.config.get("helix_url", "http://localhost:8001"))
+                hx = self._openai_chat(base_url, msgs, max_tokens=max_tok,
+                                       temperature=opts["temperature"])
+                _record_call(hx)
+                return hx["content"]
+            else:
+                payload = {
+                    "model": model,
+                    "messages": msgs,
+                    "stream": False,
+                    "options": {**opts, "num_predict": max_tok},
+                }
+                d = self.pool._api("api/chat", payload, timeout=300)
+                _record_call(d)
+                return d.get("message", {}).get("content", "")
+
+        def _force_commit(reason: str) -> dict:
+            """MorphSAT-style force commit: one final answer call, no tools."""
+            nonlocal context_ceiling_hit, stagnation_hit
+            if "ceiling" in reason:
+                context_ceiling_hit = True
+            if "stagnation" in reason or "no_new_info" in reason:
+                stagnation_hit = True
+            # Estimate how many tokens we can still generate.
+            # Subtract ~64 for FORCE_COMMIT_MSG + any pending assistant
+            # content already in messages that max_prompt_tokens doesn't
+            # reflect yet.
+            remaining = n_ctx - max_prompt_tokens - CONTEXT_MARGIN - 64
+            commit_budget = max(32, min(remaining, num_predict))
+            # Force-commit message tells the model to answer, not tool-call
+            messages.append({"role": "user", "content": FORCE_COMMIT_MSG})
+            try:
+                answer = _call_model(messages, max_tok=commit_budget)
+            except Exception:
+                answer = f"[context ceiling reached: {reason}]"
+            return _result(answer, force_commit=reason)
+
+        for turn in range(MAX_TOOL_TURNS if use_tools else 1):
+            content = _call_model(messages)
 
             if not use_tools:
                 return _result(content)
@@ -320,9 +390,23 @@ class Orchestrator:
             # Execute tool calls and feed results back
             messages.append({"role": "assistant", "content": content})
             escalations = []
+            # pending_tokens: tokens appended to messages THIS turn that
+            # haven't been reflected in max_prompt_tokens yet (which only
+            # updates on the next _call_model). Includes the assistant
+            # fence (content) plus each tool result we append below.
+            # The assistant fence is roughly the last call's predicted_n.
+            pending_tokens = _count_tokens(content)
             for tc in calls:
                 tool_name = tc.get("name", "")
                 tool_args = tc.get("arguments", {})
+
+                # Stagnation: repeated (tool_name, args) pair
+                call_sig = hashlib.md5(
+                    json.dumps([tool_name, tool_args], sort_keys=True
+                               ).encode()).hexdigest()[:8]
+                if call_sig in seen_call_hashes:
+                    return _force_commit("stagnation_repeated_call")
+                seen_call_hashes.add(call_sig)
 
                 # ask-pass gate for privileged actions
                 if not ask_pass(tool_name, json.dumps(tool_args)):
@@ -338,6 +422,22 @@ class Orchestrator:
                     continue
 
                 tool_result = active_registry.execute(tool_name, tool_args)
+
+                # No-new-info: identical result from different call.
+                # Skip for short results — empty dirs, grep misses, etc.
+                # all hash equal and would false-positive.
+                if len(tool_result) >= 40:
+                    result_hash = hashlib.md5(
+                        tool_result.encode()).hexdigest()[:8]
+                    if result_hash in seen_result_hashes:
+                        tool_calls_log.append({
+                            "name": tool_name,
+                            "arguments": tool_args,
+                            "result": tool_result[:2000],
+                        })
+                        return _force_commit("no_new_info_repeated_result")
+                    seen_result_hashes.add(result_hash)
+
                 tool_calls_log.append({
                     "name": tool_name,
                     "arguments": tool_args,
@@ -359,10 +459,25 @@ class Orchestrator:
                     except (json.JSONDecodeError, AttributeError):
                         pass
 
-                messages.append({
-                    "role": "user",
-                    "content": f"Tool result ({tool_name}):\n{tool_result[:3000]}",
-                })
+                # Token ceiling: will this result + next generation fit?
+                # pending_tokens accounts for the assistant fence AND all
+                # tool results already appended this turn.
+                result_tokens = _count_tokens(tool_result[:TOOL_RESULT_CAP])
+                est_next = (max_prompt_tokens + pending_tokens
+                            + result_tokens + num_predict)
+                if est_next > n_ctx - CONTEXT_MARGIN:
+                    # Try to fit a truncated version
+                    available = (n_ctx - CONTEXT_MARGIN - max_prompt_tokens
+                                 - pending_tokens - num_predict)
+                    max_chars = int(available * 2.5)
+                    if max_chars < 200:
+                        return _force_commit("ceiling_no_room")
+                    tool_result = tool_result[:max_chars] + "\n[truncated to fit context]"
+                    result_tokens = _count_tokens(tool_result)
+
+                msg_text = f"Tool result ({tool_name}):\n{tool_result[:TOOL_RESULT_CAP]}"
+                messages.append({"role": "user", "content": msg_text})
+                pending_tokens += _count_tokens(msg_text)
 
             # If there were escalations, include them in the result
             if escalations:
@@ -539,11 +654,15 @@ class Orchestrator:
             # Build augmented input: question + compiled evidence
             augmented_input = user_input
             if compiled["evidence"]:
+                hint = ""
+                if use_tools and compiled["sources"]:
+                    hint = ("\nEvidence above was retrieved for you; "
+                            "call tools only if it is insufficient.\n")
                 augmented_input = (
                     f"{user_input}\n\n"
                     f"--- Evidence (retrieved from local files) ---\n"
                     f"{compiled['evidence']}\n"
-                    f"--- End evidence ---"
+                    f"--- End evidence ---{hint}"
                 )
             active_reg = self._lean_registry(intent) if use_tools else None
             # Raw history is NOT passed — it's compressed into the evidence block
@@ -606,6 +725,9 @@ class Orchestrator:
             "max_prompt_tokens": gen_result.get("max_prompt_tokens", 0),
             "prompt_ms": gen_result.get("prompt_ms", 0.0),
             "timings_measured": gen_result.get("timings_measured", False),
+            "context_ceiling_hit": gen_result.get("context_ceiling_hit", False),
+            "stagnation": gen_result.get("stagnation", False),
+            "force_commit": gen_result.get("force_commit"),
         }
         task_dict["specialist_adapter_used"] = False
         task_dict["context_mode"] = context_mode
@@ -652,6 +774,9 @@ class Orchestrator:
                 "sources": compiled["sources"],
                 "searches": compiled["searches"],
             },
+            "context_ceiling_hit": gen_result.get("context_ceiling_hit", False),
+            "stagnation": gen_result.get("stagnation", False),
+            "force_commit": gen_result.get("force_commit"),
         }
         if escalations:
             result["escalations"] = escalations

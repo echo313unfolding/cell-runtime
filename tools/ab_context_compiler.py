@@ -225,7 +225,15 @@ def _start_server(config: dict, model: str) -> subprocess.Popen:
 # ---------------------------------------------------------------------------
 def run_mode(mode: str, config_path: str, scenarios: list[dict],
              use_tools: bool, depth: int) -> list[dict]:
-    os.environ["CELL_CONTEXT_COMPILER"] = "1" if mode == "compiler" else "0"
+    # compiler600 = compiler with half budget (600 tokens evidence)
+    if mode.startswith("compiler"):
+        os.environ["CELL_CONTEXT_COMPILER"] = "1"
+        if mode == "compiler600":
+            os.environ["CELL_CONTEXT_BUDGET"] = "600"
+        elif "CELL_CONTEXT_BUDGET" in os.environ:
+            del os.environ["CELL_CONTEXT_BUDGET"]
+    else:
+        os.environ["CELL_CONTEXT_COMPILER"] = "0"
     from cell.orchestrator import Orchestrator  # import after env set is fine; flag read in __init__
 
     orch = Orchestrator(config_path)
@@ -297,14 +305,23 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
                 "evidence_tokens_est": res.get("context_compiled", {}).get("tokens_est", 0),
                 "sources": res.get("context_compiled", {}).get("sources", []),
                 "receipt": res.get("receipt"),
+                "context_ceiling_hit": res.get("context_ceiling_hit", False),
+                "stagnation": res.get("stagnation", False),
+                "force_commit": res.get("force_commit"),
                 **deg,
             }
             rows.append(row)
+            flags = ""
+            if row["context_ceiling_hit"]:
+                flags += " CEIL"
+            if row["stagnation"]:
+                flags += " STAG"
             print(f"[{mode:8s}] {sc['id']:26s} T{ti} "
                   f"ctx={first_pt:5d} (uncached {first_ev:4d}) max={max_pt:5d} "
                   f"ev={evalc:4d} head={row['headroom']} "
                   f"deg={deg['degenerate']} hit={row['retrieval_hit']} "
-                  f"wall={wall}s {'ERR ' + err if err else ''}", flush=True)
+                  f"wall={wall}s{flags}"
+                  f"{'ERR ' + err if err else ''}", flush=True)
             history.append({"role": "user", "content": q})
             history.append({"role": "assistant", "content": out})
     return rows
@@ -336,6 +353,8 @@ def summarize(rows: list[dict]) -> dict:
             "mean_wall_s": round(sum(r["wall_s"] for r in rs) / len(rs), 2),
             "mean_tool_calls": round(sum(r["tool_calls"] for r in rs) / len(rs), 2),
             "turn3_degenerate": sum(1 for r in rs if r["turn"] == 3 and r["degenerate"]),
+            "context_ceiling_hits": sum(1 for r in rs if r.get("context_ceiling_hit")),
+            "stagnation_hits": sum(1 for r in rs if r.get("stagnation")),
         }
     return out
 
@@ -350,7 +369,7 @@ def main():
     ap.add_argument("--prompts", help="JSON file: list of {id, gold, turns}")
     ap.add_argument("--start-server", action="store_true",
                     help="launch llama-server from config; killed on exit")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v3_<ts>.json)")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v4_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -386,7 +405,7 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v3_{stamp}",
+        "receipt_id": f"echo_context_compiler_ab_v4_{stamp}",
         "title": "Context compiler A/B — legacy vs compiler on the same orchestrator/binary/model",
         "timestamp": stamp,
         "config": args.config,
@@ -404,6 +423,8 @@ def main():
             "headroom": "n_ctx - max_prompt_tokens - eval_tokens (conservative)",
             "degenerate": "tail_unique<8 over last 120 chars (len>=40) OR top 4-gram covers >40% of output",
             "retrieval_hit": "any gold fragment in context_compiled.sources, tool call args/results, or output",
+            "context_ceiling_hit": "tool-loop guard fired: next tool result would exceed n_ctx - margin",
+            "stagnation": "tool-loop guard fired: repeated (tool,args) or identical result from different call",
         },
         "summary": summary,
         "rows": rows,
@@ -416,6 +437,7 @@ def main():
 
     print("\n=== Summary ===")
     keys = ["turns", "errors", "degenerate_turns", "turn3_degenerate", "retrieval_hits",
+            "context_ceiling_hits", "stagnation_hits",
             "mean_first_prompt_tokens", "mean_max_prompt_tokens", "max_prompt_tokens",
             "mean_prompt_cached_frac", "mean_headroom", "min_headroom",
             "mean_prompt_ms", "mean_wall_s", "mean_tool_calls"]

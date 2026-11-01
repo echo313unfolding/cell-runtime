@@ -23,6 +23,7 @@ class ModelPool:
         self.helix_url = config.get("helix_url", "http://localhost:8001")
         self.llama_server_url = config.get("llama_server_url", "http://localhost:8080")
         self.roster = config.get("roster", {})
+        self.generation = config.get("generation", {})
         self._swap_history = []
         self._helix_proc = None
         self._llama_proc = None
@@ -205,7 +206,10 @@ class ModelPool:
             return {"error": "llama-server binary not found"}
 
         port = self.llama_server_url.rsplit(":", 1)[-1].rstrip("/")
-        gen_cfg = {"n_ctx": 4096, "n_gpu_layers": 99}
+        gen_cfg = {
+            "n_ctx": self.generation.get("num_ctx", 4096),
+            "n_gpu_layers": 99,
+        }
 
         log_path = os.path.expanduser(
             os.environ.get("CELL_RECEIPTS_DIR", "~/receipts/cell")
