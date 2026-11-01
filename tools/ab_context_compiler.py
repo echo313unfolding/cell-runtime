@@ -92,6 +92,21 @@ DEFAULT_SCENARIOS = [
         ],
     },
     {
+        # Reproduces the Oct 28 failure condition (commit 164522a): turn 1
+        # "succeeded" by dumping the raw receipt into the answer, and turn 2
+        # inherits that dump through history. Legacy passes it raw; the
+        # compiler compresses it. Skipped if the receipt isn't present.
+        "id": "af6_dump_repro",
+        "gold": ["hxq_af6", "phase0_receipt"],
+        "seed": [{"user": "Read the AF6 phase 0 receipt and show me its contents.",
+                  "assistant_from_file": "~/receipts/hxq_af6_mmq_phase0/phase0_receipt.json"}],
+        "turns": [
+            "Based on that receipt, which model, binary and baseline formats were measured?",
+            "What were the measured tokens per second, and how do they compare to the baseline?",
+            "Summarize the verdict in two sentences.",
+        ],
+    },
+    {
         "id": "coding",
         "gold": [],
         "turns": [
@@ -222,8 +237,24 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
 
     rows = []
     for sc in scenarios:
-        orch.memory.reset()
+        orch.reset_session() if hasattr(orch, "reset_session") else orch.memory.reset()
         history: list[dict] = []
+        skip = False
+        for seed in sc.get("seed", []):
+            if "assistant_from_file" in seed:
+                fp = os.path.expanduser(seed["assistant_from_file"])
+                if not os.path.isfile(fp):
+                    print(f"[{mode:8s}] {sc['id']:26s} skipped: {fp} missing", flush=True)
+                    skip = True
+                    break
+                with open(fp) as f:
+                    content = f.read()
+            else:
+                content = seed.get("assistant", "")
+            history.append({"role": "user", "content": seed["user"]})
+            history.append({"role": "assistant", "content": content})
+        if skip:
+            continue
         for ti, q in enumerate(sc["turns"][:depth], start=1):
             t0 = time.time()
             err = None
@@ -236,7 +267,9 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
             wall = round(time.time() - t0, 3)
             out = res.get("output", "") or ""
             deg = _degenerate(out)
-            first_pt = res.get("first_prompt_tokens", 0)
+            first_pt = res.get("first_prompt_tokens", 0)      # full context, 1st call
+            first_ev = res.get("first_prompt_evaluated", 0)   # of which uncached
+            max_pt = res.get("max_prompt_tokens", 0) or first_pt
             evalc = res.get("eval_count", 0)
             row = {
                 "mode": mode,
@@ -246,9 +279,15 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
                 "error": err or res.get("error"),
                 "timings_measured": res.get("timings_measured", False),
                 "first_prompt_tokens": first_pt,
+                "first_prompt_evaluated": first_ev,
+                "first_prompt_cached": max(0, first_pt - first_ev),
+                "max_prompt_tokens": max_pt,
                 "prompt_tokens_total": res.get("prompt_tokens", 0),
+                "prompt_ms": res.get("prompt_ms", 0.0),
                 "eval_tokens": evalc,
-                "headroom": (n_ctx - first_pt - evalc) if first_pt else None,
+                # conservative: largest context any call saw, minus all tokens
+                # generated across the loop
+                "headroom": (n_ctx - max_pt - evalc) if max_pt else None,
                 "tok_s": res.get("tok_s", 0),
                 "wall_s": wall,
                 "tool_calls": res.get("tool_calls", 0),
@@ -262,7 +301,8 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
             }
             rows.append(row)
             print(f"[{mode:8s}] {sc['id']:26s} T{ti} "
-                  f"pt={first_pt:5d} ev={evalc:4d} head={row['headroom']} "
+                  f"ctx={first_pt:5d} (uncached {first_ev:4d}) max={max_pt:5d} "
+                  f"ev={evalc:4d} head={row['headroom']} "
                   f"deg={deg['degenerate']} hit={row['retrieval_hit']} "
                   f"wall={wall}s {'ERR ' + err if err else ''}", flush=True)
             history.append({"role": "user", "content": q})
@@ -283,6 +323,13 @@ def summarize(rows: list[dict]) -> dict:
             "retrieval_hits": f"{sum(1 for r in scored if r['retrieval_hit'])}/{len(scored)}",
             "mean_first_prompt_tokens": round(
                 sum(r["first_prompt_tokens"] for r in measured) / len(measured), 1) if measured else None,
+            "mean_max_prompt_tokens": round(
+                sum(r["max_prompt_tokens"] for r in measured) / len(measured), 1) if measured else None,
+            "max_prompt_tokens": max((r["max_prompt_tokens"] for r in measured), default=None),
+            "mean_prompt_cached_frac": round(
+                sum(r["first_prompt_cached"] for r in measured)
+                / max(1, sum(r["first_prompt_tokens"] for r in measured)), 3) if measured else None,
+            "mean_prompt_ms": round(sum(r["prompt_ms"] for r in rs) / len(rs), 1),
             "mean_headroom": round(
                 sum(r["headroom"] for r in measured) / len(measured), 1) if measured else None,
             "min_headroom": min((r["headroom"] for r in measured), default=None),
@@ -303,7 +350,7 @@ def main():
     ap.add_argument("--prompts", help="JSON file: list of {id, gold, turns}")
     ap.add_argument("--start-server", action="store_true",
                     help="launch llama-server from config; killed on exit")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v2_<ts>.json)")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v3_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -339,7 +386,7 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v2_{stamp}",
+        "receipt_id": f"echo_context_compiler_ab_v3_{stamp}",
         "title": "Context compiler A/B — legacy vs compiler on the same orchestrator/binary/model",
         "timestamp": stamp,
         "config": args.config,
@@ -351,8 +398,10 @@ def main():
         "depth": args.depth,
         "scenarios": [{"id": s["id"], "gold": s["gold"], "n_turns": len(s["turns"])} for s in scenarios],
         "metric_definitions": {
-            "first_prompt_tokens": "llama-server timings.prompt_n of the first call in the turn (= context cost before any tool loop)",
-            "headroom": "n_ctx - first_prompt_tokens - eval_tokens",
+            "first_prompt_tokens": "usage.prompt_tokens of the first call in the turn = FULL context the model saw (counts against n_ctx)",
+            "first_prompt_evaluated": "timings.prompt_n of that call = tokens not served from llama-server prompt cache (speed, not occupancy)",
+            "max_prompt_tokens": "largest usage.prompt_tokens of any call in the turn's tool loop",
+            "headroom": "n_ctx - max_prompt_tokens - eval_tokens (conservative)",
             "degenerate": "tail_unique<8 over last 120 chars (len>=40) OR top 4-gram covers >40% of output",
             "retrieval_hit": "any gold fragment in context_compiled.sources, tool call args/results, or output",
         },
@@ -367,7 +416,9 @@ def main():
 
     print("\n=== Summary ===")
     keys = ["turns", "errors", "degenerate_turns", "turn3_degenerate", "retrieval_hits",
-            "mean_first_prompt_tokens", "mean_headroom", "min_headroom", "mean_wall_s", "mean_tool_calls"]
+            "mean_first_prompt_tokens", "mean_max_prompt_tokens", "max_prompt_tokens",
+            "mean_prompt_cached_frac", "mean_headroom", "min_headroom",
+            "mean_prompt_ms", "mean_wall_s", "mean_tool_calls"]
     modes = list(summary)
     print(f"{'metric':26s}" + "".join(f"{m:>14s}" for m in modes))
     for k in keys:

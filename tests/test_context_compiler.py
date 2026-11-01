@@ -234,7 +234,7 @@ def test_context_mode_switch(orch_config, monkeypatch, receipts, flag, expected_
         assert res["context_compiled"]["sources"] == []
 
 
-def test_openai_chat_prefers_timings(orch_config, monkeypatch):
+def test_openai_chat_splits_usage_and_timings(orch_config, monkeypatch):
     from cell.orchestrator import Orchestrator
     monkeypatch.setenv("CELL_CONTEXT_COMPILER", "1")
     o = Orchestrator(orch_config)
@@ -245,11 +245,91 @@ def test_openai_chat_prefers_timings(orch_config, monkeypatch):
                     "prompt_ms": 120.5, "predicted_ms": 1540.0},
     })
     r = o._openai_chat("http://x", [{"role": "user", "content": "q"}])
-    assert r["prompt_tokens"] == 410 and r["eval_count"] == 57
-    assert r["predicted_ms"] == 1540.0
+    # usage.prompt_tokens is the full context; timings.prompt_n the uncached part
+    assert r["prompt_tokens"] == 999 and r["prompt_evaluated"] == 410
+    assert r["eval_count"] == 57 and r["predicted_ms"] == 1540.0
 
     g = o._generate("m", "q")
     assert g["timings_measured"] is True
     assert g["eval_duration"] == int(1540.0 * 1e6)
     assert g["prompt_eval_duration"] == int(120.5 * 1e6)
-    assert g["first_prompt_tokens"] == 410
+    assert g["first_prompt_tokens"] == 999
+    assert g["first_prompt_evaluated"] == 410
+
+
+# ---------------------------------------------------------------------------
+# 5. follow-up carry-forward of prior sources
+# ---------------------------------------------------------------------------
+def test_follow_up_carries_prior_receipts_when_search_is_empty(receipts):
+    first = cc.compile_context("hxq af6 benchmark quadro t2000", "reasoning")
+    assert first["sources"]
+    prior = [s for s in first["sources"] if s.endswith(".json")]
+
+    follow = cc.compile_context("what were the tokens per second?", "reasoning",
+                                history_summary="Q: hxq af6\nA: found it\n",
+                                prior_sources=prior)
+    assert any(s["type"] == "carry_forward" for s in follow["searches"])
+    assert set(prior) <= set(follow["sources"])
+    assert "tg128: 37.40" in follow["evidence"]
+
+
+def test_follow_up_prefers_fresh_strong_hits(receipts):
+    prior = [str(receipts / "hxq_af6_mmq_phase0" / "phase0_receipt.json")]
+    out = cc.compile_context("hxq contribution model validation", "reasoning",
+                             prior_sources=prior)
+    names = [Path(s).name for s in out["sources"]]
+    # fresh search scores >= 2 (hxq + contribution/model/validation) → no carry
+    assert not any(s["type"] == "carry_forward" for s in out["searches"])
+    assert names[0].startswith("WO_HXQ_CONTRIBUTION")
+
+
+def test_no_carry_forward_without_prior(receipts):
+    out = cc.compile_context("what were the tokens per second?", "reasoning")
+    assert not any(s["type"] == "carry_forward" for s in out["searches"])
+
+
+# ---------------------------------------------------------------------------
+# 6. prompt accounting: full context from usage, cache split from timings
+# ---------------------------------------------------------------------------
+def test_prompt_tokens_use_full_context_not_uncached_slice(orch_config, monkeypatch):
+    from cell.orchestrator import Orchestrator
+    monkeypatch.setenv("CELL_CONTEXT_COMPILER", "1")
+    o = Orchestrator(orch_config)
+    monkeypatch.setattr(o.pool, "_http", lambda url, payload, timeout=0: {
+        "choices": [{"message": {"content": "hi"}}],
+        "usage": {"prompt_tokens": 1582, "completion_tokens": 50},
+        # system prompt cached: llama-server only evaluated the question
+        "timings": {"prompt_n": 31, "predicted_n": 50,
+                    "prompt_ms": 40.0, "predicted_ms": 900.0},
+    })
+    r = o._openai_chat("http://x", [{"role": "user", "content": "q"}])
+    assert r["prompt_tokens"] == 1582
+    assert r["prompt_evaluated"] == 31
+    assert r["prompt_cached"] == 1551
+    g = o._generate("m", "q")
+    assert g["first_prompt_tokens"] == 1582
+    assert g["first_prompt_evaluated"] == 31
+    assert g["max_prompt_tokens"] == 1582
+
+
+def test_orchestrator_threads_prior_sources_across_turns(orch_config, monkeypatch, receipts):
+    from cell.orchestrator import Orchestrator
+    monkeypatch.setenv("CELL_CONTEXT_COMPILER", "1")
+    captured = {}
+    monkeypatch.setattr(Orchestrator, "_generate", _stub_generate(captured))
+    o = Orchestrator(orch_config)
+    o.pool._llama_current_model = "m"
+    monkeypatch.setattr(o.pool, "_llama_server_alive", lambda: True)
+
+    r1 = o.process("hxq af6 benchmark quadro t2000", force_model="m")
+    assert r1["context_compiled"]["sources"]
+    assert o._prior_sources
+    hist = [{"role": "user", "content": "hxq af6 benchmark"},
+            {"role": "assistant", "content": "found the AF6 receipt and read it"}]
+    r2 = o.process("what were the tokens per second?", force_model="m", history=hist)
+    types = [s["type"] for s in r2["context_compiled"]["searches"]]
+    assert "carry_forward" in types
+    assert "tg128" in captured["user_input"]
+
+    o.reset_session()
+    assert o._prior_sources == []

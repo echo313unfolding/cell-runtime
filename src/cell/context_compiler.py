@@ -27,6 +27,10 @@ CHARS_PER_TOKEN = 4
 # receipt families get read into the evidence block.
 RECEIPT_CANDIDATES = 10
 MAX_RECEIPTS = 3
+# A fresh search whose best hit scores below this is treated as weak and the
+# previous turn's receipts are read first. Score 1 = one keyword matched
+# somewhere in the path, which "hxq" alone does for most of ~/receipts.
+CARRY_FORWARD_BELOW = 2
 
 # Search paths
 RECEIPT_DIR = Path(os.path.expanduser("~/receipts"))
@@ -37,8 +41,14 @@ FGIP_DB = os.path.expanduser("~/fgip-engine/fgip.db")
 
 def compile_context(question: str, intent: str,
                     history_summary: str = "",
-                    token_budget: int = 1200) -> dict:
+                    token_budget: int = 1200,
+                    prior_sources: Optional[list[str]] = None) -> dict:
     """Search for evidence relevant to the question and build a compact context.
+
+    prior_sources: receipt paths read on the previous turn. Used only as a
+        fallback when this turn's own search is empty or weak (top score
+        < CARRY_FORWARD_BELOW), which is what a follow-up question looks
+        like ("what were the tokens per second?" has no receipt keywords).
 
     Returns:
         {
@@ -60,6 +70,22 @@ def compile_context(question: str, intent: str,
     receipt_hits = _search_receipts(keywords)
     searches.append({"type": "receipts", "keywords": keywords,
                      "hits": len(receipt_hits)})
+
+    # 1b. Follow-up fallback: carry the previous turn's receipts forward
+    #     when the fresh search found nothing worth reading.
+    if prior_sources and (not receipt_hits
+                          or receipt_hits[0]["score"] < CARRY_FORWARD_BELOW):
+        seen = {h["path"] for h in receipt_hits}
+        carried = []
+        for p in prior_sources:
+            if p in seen or not os.path.isfile(p):
+                continue
+            carried.append({"path": p, "name": os.path.basename(p),
+                            "score": 0, "size": os.path.getsize(p),
+                            "carried": True})
+        if carried:
+            receipt_hits = carried + receipt_hits
+            searches.append({"type": "carry_forward", "hits": len(carried)})
 
     # 2. Search FGIP claims if DB exists
     fgip_hits = _search_fgip(keywords)

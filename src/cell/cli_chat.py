@@ -117,6 +117,8 @@ def run_chat(config_path: str = None, force_model: str = None, use_tools: bool =
             elif cmd == "/clear":
                 history.clear()
                 turn_count = 0
+                if hasattr(orch, "reset_session"):
+                    orch.reset_session()
                 print("  Session history cleared.")
                 continue
 

@@ -102,6 +102,12 @@ class Orchestrator:
         # Specialist adapters (e.g., Sentinel hybrid stack)
         self.specialists = create_specialist_registry()
 
+        # Receipt paths the compiler read on the previous turn of this
+        # session. Follow-up questions ("what were the tok/s?") rarely
+        # keyword-match the receipt they're about; compile_context falls
+        # back to these when the fresh search is empty or weak.
+        self._prior_sources: list[str] = []
+
         # Resolve logging paths
         log_cfg = self.config.get("logging", {})
         self.swap_log_path = Path(os.path.expanduser(
@@ -110,6 +116,11 @@ class Orchestrator:
             log_cfg.get("task_dir", "~/receipts/cell/tasks/")))
         self.swap_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.task_dir.mkdir(parents=True, exist_ok=True)
+
+    def reset_session(self):
+        """Start a fresh conversation: clear memory lane and carried sources."""
+        self.memory.reset()
+        self._prior_sources = []
 
     def _lean_registry(self, intent: str) -> ToolRegistry:
         """Build a lean tool registry containing only tools relevant to this intent."""
@@ -175,16 +186,26 @@ class Orchestrator:
         choice = data.get("choices", [{}])[0]
         content = choice.get("message", {}).get("content", "")
         usage = data.get("usage", {})
-        # llama-server also returns a `timings` block with measured
-        # prompt/predict counts and wall-clock ms. Prefer it over `usage`
-        # when present — it's the real number, not an estimate.
+        # Two different prompt numbers, and they answer different questions:
+        #   usage.prompt_tokens  — the FULL context the model saw (what counts
+        #                          against n_ctx)
+        #   timings.prompt_n     — tokens llama-server actually EVALUATED this
+        #                          call, i.e. not served from its prompt cache.
+        #                          A constant system prompt is cached after the
+        #                          first call, so prompt_n drops to ~question
+        #                          size on later calls.
+        # Context occupancy must come from usage; speed from timings. (The
+        # first A/B run conflated them and under-reported legacy context 5x.)
         timings = data.get("timings") or {}
+        full_prompt = usage.get("prompt_tokens") or timings.get("prompt_n", 0)
+        evaluated = timings.get("prompt_n", full_prompt)
         return {
             "content": content,
             "eval_count": timings.get("predicted_n",
                                       usage.get("completion_tokens", 0)),
-            "prompt_tokens": timings.get("prompt_n",
-                                         usage.get("prompt_tokens", 0)),
+            "prompt_tokens": full_prompt,
+            "prompt_evaluated": evaluated,
+            "prompt_cached": max(0, full_prompt - evaluated),
             "prompt_ms": timings.get("prompt_ms", 0.0),
             "predicted_ms": timings.get("predicted_ms", 0.0),
         }
@@ -220,7 +241,9 @@ class Orchestrator:
         total_eval_duration = 0
         total_prompt_tokens = 0
         total_prompt_ms = 0.0
-        first_prompt_tokens = None   # prompt size of the FIRST call = context cost
+        first_prompt_tokens = None   # FULL context of the first call (vs n_ctx)
+        first_prompt_evaluated = None  # of which, tokens not served from cache
+        max_prompt_tokens = 0        # largest context any call in the loop saw
         timings_measured = False
         tool_calls_log = []
         data = None
@@ -239,6 +262,9 @@ class Orchestrator:
                     if backend == "ollama" and data else 0),
                 "prompt_tokens": total_prompt_tokens,
                 "first_prompt_tokens": first_prompt_tokens or 0,
+                "first_prompt_evaluated": first_prompt_evaluated or 0,
+                "max_prompt_tokens": max_prompt_tokens,
+                "prompt_ms": round(total_prompt_ms, 1),
                 "timings_measured": timings_measured,
                 "tool_calls": tool_calls_log,
             }
@@ -256,8 +282,10 @@ class Orchestrator:
                 content = hx["content"]
                 total_eval_count += hx["eval_count"]
                 total_prompt_tokens += hx.get("prompt_tokens", 0)
+                max_prompt_tokens = max(max_prompt_tokens, hx.get("prompt_tokens", 0))
                 if first_prompt_tokens is None:
                     first_prompt_tokens = hx.get("prompt_tokens", 0)
+                    first_prompt_evaluated = hx.get("prompt_evaluated", first_prompt_tokens)
                 if hx.get("predicted_ms"):
                     # Real wall-clock from llama-server timings
                     total_eval_duration += int(hx["predicted_ms"] * 1e6)
@@ -503,7 +531,10 @@ class Orchestrator:
                 user_input, intent,
                 history_summary=history_summary,
                 token_budget=self.context_token_budget,
+                prior_sources=self._prior_sources if history else None,
             )
+            self._prior_sources = [
+                s for s in compiled["sources"] if s.endswith(".json")]
 
             # Build augmented input: question + compiled evidence
             augmented_input = user_input
@@ -571,6 +602,9 @@ class Orchestrator:
             # otherwise estimated from the roster tok_s.
             "prompt_tokens": gen_result.get("prompt_tokens", 0),
             "first_prompt_tokens": gen_result.get("first_prompt_tokens", 0),
+            "first_prompt_evaluated": gen_result.get("first_prompt_evaluated", 0),
+            "max_prompt_tokens": gen_result.get("max_prompt_tokens", 0),
+            "prompt_ms": gen_result.get("prompt_ms", 0.0),
             "timings_measured": gen_result.get("timings_measured", False),
         }
         task_dict["specialist_adapter_used"] = False
@@ -609,6 +643,9 @@ class Orchestrator:
             "context_mode": context_mode,
             "prompt_tokens": gen_result.get("prompt_tokens", 0),
             "first_prompt_tokens": gen_result.get("first_prompt_tokens", 0),
+            "first_prompt_evaluated": gen_result.get("first_prompt_evaluated", 0),
+            "max_prompt_tokens": gen_result.get("max_prompt_tokens", 0),
+            "prompt_ms": gen_result.get("prompt_ms", 0.0),
             "timings_measured": gen_result.get("timings_measured", False),
             "context_compiled": {
                 "tokens_est": compiled["tokens_est"],
