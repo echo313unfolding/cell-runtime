@@ -257,6 +257,9 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
                     break
                 with open(fp) as f:
                     content = f.read()
+                # Prime carry-forward so T1 can find the seed receipt
+                if hasattr(orch, "_prior_sources"):
+                    orch._prior_sources = [fp]
             else:
                 content = seed.get("assistant", "")
             history.append({"role": "user", "content": seed["user"]})
@@ -346,6 +349,12 @@ def summarize(rows: list[dict]) -> dict:
             "mean_prompt_cached_frac": round(
                 sum(r["first_prompt_cached"] for r in measured)
                 / max(1, sum(r["first_prompt_tokens"] for r in measured)), 3) if measured else None,
+            "cached_frac_by_turn": {
+                f"T{t}": round(
+                    sum(r["first_prompt_cached"] for r in measured if r["turn"] == t)
+                    / max(1, sum(r["first_prompt_tokens"] for r in measured if r["turn"] == t)), 3)
+                for t in sorted({r["turn"] for r in measured})
+            } if measured else {},
             "mean_prompt_ms": round(sum(r["prompt_ms"] for r in rs) / len(rs), 1),
             "mean_headroom": round(
                 sum(r["headroom"] for r in measured) / len(measured), 1) if measured else None,
@@ -405,7 +414,7 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v4_{stamp}",
+        "receipt_id": f"echo_context_compiler_ab_v5_{stamp}",
         "title": "Context compiler A/B — legacy vs compiler on the same orchestrator/binary/model",
         "timestamp": stamp,
         "config": args.config,
@@ -439,12 +448,21 @@ def main():
     keys = ["turns", "errors", "degenerate_turns", "turn3_degenerate", "retrieval_hits",
             "context_ceiling_hits", "stagnation_hits",
             "mean_first_prompt_tokens", "mean_max_prompt_tokens", "max_prompt_tokens",
-            "mean_prompt_cached_frac", "mean_headroom", "min_headroom",
+            "mean_prompt_cached_frac", "cached_frac_by_turn",
+            "mean_headroom", "min_headroom",
             "mean_prompt_ms", "mean_wall_s", "mean_tool_calls"]
     modes = list(summary)
     print(f"{'metric':26s}" + "".join(f"{m:>14s}" for m in modes))
     for k in keys:
-        print(f"{k:26s}" + "".join(f"{str(summary[m][k]):>14s}" for m in modes))
+        if k == "cached_frac_by_turn":
+            # Expand per-turn cache fractions into separate rows
+            all_turns = sorted({t for m in modes for t in summary[m].get(k, {})})
+            for t in all_turns:
+                label = f"  cached_frac_{t}"
+                print(f"{label:26s}" + "".join(
+                    f"{str(summary[m].get(k, {}).get(t, '')):>14s}" for m in modes))
+        else:
+            print(f"{k:26s}" + "".join(f"{str(summary[m][k]):>14s}" for m in modes))
     print(f"\nreceipt: {out}")
 
 

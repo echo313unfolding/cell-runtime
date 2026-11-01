@@ -71,10 +71,17 @@ def compile_context(question: str, intent: str,
     searches.append({"type": "receipts", "keywords": keywords,
                      "hits": len(receipt_hits)})
 
-    # 1b. Follow-up fallback: carry the previous turn's receipts forward
-    #     when the fresh search found nothing worth reading.
-    if prior_sources and (not receipt_hits
-                          or receipt_hits[0]["score"] < CARRY_FORWARD_BELOW):
+    # 1b. Follow-up: carry the previous turn's receipts forward.
+    #
+    #     Two modes:
+    #       - Weak fresh search (top score < CARRY_FORWARD_BELOW): carry ALL
+    #         prior sources to the front (they become the primary evidence).
+    #       - Decent fresh search: still reserve ONE slot for the best prior
+    #         source so T3 follow-ups don't lose the receipt they're about
+    #         when generic words like "baseline" or "receipt" score 1–2 on
+    #         wrong files.
+    if prior_sources:
+        weak_fresh = not receipt_hits or receipt_hits[0]["score"] < CARRY_FORWARD_BELOW
         seen = {h["path"] for h in receipt_hits}
         carried = []
         for p in prior_sources:
@@ -83,6 +90,8 @@ def compile_context(question: str, intent: str,
             carried.append({"path": p, "name": os.path.basename(p),
                             "score": 0, "size": os.path.getsize(p),
                             "carried": True})
+            if not weak_fresh:
+                break  # reserve only one slot when fresh search is decent
         if carried:
             receipt_hits = carried + receipt_hits
             searches.append({"type": "carry_forward", "hits": len(carried)})

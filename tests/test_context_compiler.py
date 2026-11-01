@@ -274,14 +274,22 @@ def test_follow_up_carries_prior_receipts_when_search_is_empty(receipts):
     assert "tg128: 37.40" in follow["evidence"]
 
 
-def test_follow_up_prefers_fresh_strong_hits(receipts):
+def test_follow_up_reserves_one_slot_with_strong_fresh_hits(receipts):
+    # Prior source is phase0 receipt.  Follow-up query uses keywords that
+    # match the WO_HXQ_CONTRIBUTION file at score ≥2 but NOT phase0 (no
+    # "hxq", "af6", "phase0" → phase0 scores 0 in fresh search).
     prior = [str(receipts / "hxq_af6_mmq_phase0" / "phase0_receipt.json")]
-    out = cc.compile_context("hxq contribution model validation", "reasoning",
+    out = cc.compile_context("contribution model validation gate", "reasoning",
                              prior_sources=prior)
     names = [Path(s).name for s in out["sources"]]
-    # fresh search scores >= 2 (hxq + contribution/model/validation) → no carry
-    assert not any(s["type"] == "carry_forward" for s in out["searches"])
-    assert names[0].startswith("WO_HXQ_CONTRIBUTION")
+    # Fresh search found WO_HXQ at ≥2 (strong), but carry-forward still
+    # reserves one slot for the prior receipt
+    carry_searches = [s for s in out["searches"] if s["type"] == "carry_forward"]
+    assert len(carry_searches) == 1
+    assert carry_searches[0]["hits"] == 1  # only one slot reserved
+    assert "phase0_receipt.json" in names
+    # Fresh hit is still present
+    assert any(n.startswith("WO_HXQ_CONTRIBUTION") for n in names)
 
 
 def test_no_carry_forward_without_prior(receipts):
@@ -506,6 +514,38 @@ def test_short_result_no_new_info_not_triggered(orch_config, monkeypatch):
     # Should NOT have triggered stagnation — results are short
     assert result["stagnation"] is False
     assert result["content"] == "No matches found in either directory."
+
+
+def test_error_results_excluded_from_no_new_info(orch_config, monkeypatch):
+    """Identical error strings from different calls should NOT trigger no-new-info.
+    The model is hitting a constraint, not getting no new information."""
+    call_a = '```tool_call\n{"name": "grep", "arguments": {"pattern": "cron", "path": "/home/user"}}\n```'
+    call_b = '```tool_call\n{"name": "grep", "arguments": {"pattern": "cron", "path": "/"}}\n```'
+    responses = [
+        {"content": call_a, "prompt_tokens": 500, "eval_tokens": 20},
+        {"content": call_b, "prompt_tokens": 700, "eval_tokens": 20},
+        {"content": "I could not find the cron job.", "prompt_tokens": 800, "eval_tokens": 25},
+    ]
+    o = _make_tool_loop_orch(orch_config, monkeypatch, responses)
+    from cell.tool_registry import ToolRegistry
+    reg = ToolRegistry()
+    # Both return identical errors (≥40 chars) — should NOT trigger no_new_info
+    reg.register("grep", lambda pattern="", path="": "Error: path must be under /home/voidstr3m33", "search files")
+    result = o._generate("m", "find cron jobs", use_tools=True, tool_registry=reg)
+    assert result["stagnation"] is False
+    assert result["content"] == "I could not find the cron job."
+
+
+def test_carry_forward_skips_when_prior_already_in_fresh_results(receipts):
+    """When prior source is already found by fresh search, carry doesn't duplicate."""
+    prior = [str(receipts / "hxq_af6_mmq_phase0" / "phase0_receipt.json")]
+    # "hxq" in query → phase0's dir scores 1 → phase0 already in fresh results
+    out = cc.compile_context("hxq contribution model validation", "reasoning",
+                             prior_sources=prior)
+    # No carry needed — prior is already found by fresh search
+    assert not any(s["type"] == "carry_forward" for s in out["searches"])
+    # But the prior source still appears (via fresh search, not carry)
+    assert any("phase0" in s for s in out["sources"])
 
 
 def test_evidence_hint_appended_when_compiler_has_sources(orch_config, monkeypatch, receipts):

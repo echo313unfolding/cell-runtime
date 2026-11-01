@@ -426,7 +426,12 @@ class Orchestrator:
                 # No-new-info: identical result from different call.
                 # Skip for short results — empty dirs, grep misses, etc.
                 # all hash equal and would false-positive.
-                if len(tool_result) >= 40:
+                # Also skip error strings — identical errors from different
+                # calls mean the model is hitting a constraint, not that
+                # there's no new information.  The call-hash still catches
+                # a genuine loop (same tool + same args).
+                if (len(tool_result) >= 40
+                        and not tool_result.startswith("Error:")):
                     result_hash = hashlib.md5(
                         tool_result.encode()).hexdigest()[:8]
                     if result_hash in seen_result_hashes:
