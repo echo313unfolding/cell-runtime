@@ -109,11 +109,15 @@ class Orchestrator:
         # Specialist adapters (e.g., Sentinel hybrid stack)
         self.specialists = create_specialist_registry()
 
-        # Receipt paths the compiler read on the previous turn of this
+        # Receipt excerpts the compiler read on the previous turn of this
         # session. Follow-up questions ("what were the tok/s?") rarely
         # keyword-match the receipt they're about; compile_context falls
         # back to these when the fresh search is empty or weak.
-        self._prior_sources: list[str] = []
+        # Each entry: {"path": str, "name": str, "excerpt": str}.
+        # The stored excerpt text is reused verbatim on carry-forward so
+        # the byte prefix of the evidence block is identical across turns,
+        # enabling llama-server's prompt cache.
+        self._prior_excerpts: list[dict] = []
 
         # Resolve logging paths
         log_cfg = self.config.get("logging", {})
@@ -125,9 +129,9 @@ class Orchestrator:
         self.task_dir.mkdir(parents=True, exist_ok=True)
 
     def reset_session(self):
-        """Start a fresh conversation: clear memory lane and carried sources."""
+        """Start a fresh conversation: clear memory lane and carried excerpts."""
         self.memory.reset()
-        self._prior_sources = []
+        self._prior_excerpts = []
 
     def _lean_registry(self, intent: str) -> ToolRegistry:
         """Build a lean tool registry containing only tools relevant to this intent."""
@@ -430,8 +434,11 @@ class Orchestrator:
                 # calls mean the model is hitting a constraint, not that
                 # there's no new information.  The call-hash still catches
                 # a genuine loop (same tool + same args).
+                result_lower = tool_result.lower()
                 if (len(tool_result) >= 40
-                        and not tool_result.startswith("Error:")):
+                        and not result_lower.startswith(
+                            ("error", "permission", "timeout",
+                             "unknown tool", "tool error", "agent error"))):
                     result_hash = hashlib.md5(
                         tool_result.encode()).hexdigest()[:8]
                     if result_hash in seen_result_hashes:
@@ -651,12 +658,14 @@ class Orchestrator:
                 user_input, intent,
                 history_summary=history_summary,
                 token_budget=self.context_token_budget,
-                prior_sources=self._prior_sources if history else None,
+                prior_excerpts=self._prior_excerpts if history else None,
             )
-            self._prior_sources = [
-                s for s in compiled["sources"] if s.endswith(".json")]
+            self._prior_excerpts = compiled.get("excerpts", [])
 
-            # Build augmented input: question + compiled evidence
+            # Build augmented input: evidence FIRST, then question.
+            # Evidence goes at the front so the carried excerpts form a
+            # byte-stable prefix across T2/T3, letting llama-server's
+            # prompt cache cover them.
             augmented_input = user_input
             if compiled["evidence"]:
                 hint = ""
@@ -664,10 +673,10 @@ class Orchestrator:
                     hint = ("\nEvidence above was retrieved for you; "
                             "call tools only if it is insufficient.\n")
                 augmented_input = (
-                    f"{user_input}\n\n"
                     f"--- Evidence (retrieved from local files) ---\n"
                     f"{compiled['evidence']}\n"
-                    f"--- End evidence ---{hint}"
+                    f"--- End evidence ---\n{hint}\n"
+                    f"{user_input}"
                 )
             active_reg = self._lean_registry(intent) if use_tools else None
             # Raw history is NOT passed — it's compressed into the evidence block

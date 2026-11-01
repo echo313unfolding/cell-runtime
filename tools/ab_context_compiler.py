@@ -193,7 +193,8 @@ def _find_binary() -> str | None:
     return None
 
 
-def _start_server(config: dict, model: str) -> subprocess.Popen:
+def _start_server(config: dict, model: str,
+                  extra_args: str = "") -> subprocess.Popen:
     binary = _find_binary()
     if not binary:
         sys.exit("no llama-server binary found")
@@ -205,11 +206,13 @@ def _start_server(config: dict, model: str) -> subprocess.Popen:
     env["LD_LIBRARY_PATH"] = f"{os.path.dirname(binary)}:{env.get('LD_LIBRARY_PATH', '')}"
     log = Path(os.path.expanduser("~/receipts/cell/ab_llama_server.log"))
     log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [binary, "--model", gguf, "--port", port,
+           "--ctx-size", str(gen.get("num_ctx", 4096)),
+           "--n-gpu-layers", "99", "--host", "127.0.0.1"]
+    if extra_args:
+        cmd.extend(extra_args.split())
     proc = subprocess.Popen(
-        [binary, "--model", gguf, "--port", port,
-         "--ctx-size", str(gen.get("num_ctx", 4096)),
-         "--n-gpu-layers", "99", "--host", "127.0.0.1"],
-        stdout=open(log, "w"), stderr=subprocess.STDOUT, env=env,
+        cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT, env=env,
         preexec_fn=os.setsid)
     for _ in range(120):
         if _health(url):
@@ -257,9 +260,14 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
                     break
                 with open(fp) as f:
                     content = f.read()
-                # Prime carry-forward so T1 can find the seed receipt
-                if hasattr(orch, "_prior_sources"):
-                    orch._prior_sources = [fp]
+                # Prime carry-forward so T1 can find the seed receipt.
+                # Store the full excerpt so the byte prefix is stable.
+                if hasattr(orch, "_prior_excerpts"):
+                    from cell.context_compiler import _read_receipt_compact
+                    excerpt = _read_receipt_compact(fp, 2000) or ""
+                    orch._prior_excerpts = [{"path": fp,
+                                             "name": os.path.basename(fp),
+                                             "excerpt": excerpt}]
             else:
                 content = seed.get("assistant", "")
             history.append({"role": "user", "content": seed["user"]})
@@ -378,7 +386,9 @@ def main():
     ap.add_argument("--prompts", help="JSON file: list of {id, gold, turns}")
     ap.add_argument("--start-server", action="store_true",
                     help="launch llama-server from config; killed on exit")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v4_<ts>.json)")
+    ap.add_argument("--llama-args", default="",
+                    help="extra args passed to llama-server (e.g. '--cache-reuse 256')")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v5_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -395,7 +405,8 @@ def main():
 
     proc = None
     if args.start_server:
-        proc = _start_server(config, config["default_model"])
+        proc = _start_server(config, config["default_model"],
+                             extra_args=args.llama_args)
     elif not _health(url):
         sys.exit(f"llama-server not healthy at {url}; pass --start-server or start it yourself")
 

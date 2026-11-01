@@ -264,13 +264,15 @@ def test_openai_chat_splits_usage_and_timings(orch_config, monkeypatch):
 def test_follow_up_carries_prior_receipts_when_search_is_empty(receipts):
     first = cc.compile_context("hxq af6 benchmark quadro t2000", "reasoning")
     assert first["sources"]
-    prior = [s for s in first["sources"] if s.endswith(".json")]
+    assert first["excerpts"]  # excerpts returned for next-turn carry
+    prior_excerpts = first["excerpts"]
 
     follow = cc.compile_context("what were the tokens per second?", "reasoning",
                                 history_summary="Q: hxq af6\nA: found it\n",
-                                prior_sources=prior)
+                                prior_excerpts=prior_excerpts)
     assert any(s["type"] == "carry_forward" for s in follow["searches"])
-    assert set(prior) <= set(follow["sources"])
+    prior_paths = [e["path"] for e in prior_excerpts]
+    assert set(prior_paths) <= set(follow["sources"])
     assert "tg128: 37.40" in follow["evidence"]
 
 
@@ -278,9 +280,12 @@ def test_follow_up_reserves_one_slot_with_strong_fresh_hits(receipts):
     # Prior source is phase0 receipt.  Follow-up query uses keywords that
     # match the WO_HXQ_CONTRIBUTION file at score ≥2 but NOT phase0 (no
     # "hxq", "af6", "phase0" → phase0 scores 0 in fresh search).
-    prior = [str(receipts / "hxq_af6_mmq_phase0" / "phase0_receipt.json")]
+    phase0_path = str(receipts / "hxq_af6_mmq_phase0" / "phase0_receipt.json")
+    prior_excerpts = [{"path": phase0_path,
+                       "name": "phase0_receipt.json",
+                       "excerpt": "File: phase0_receipt.json\ntitle: AF6 phase 0"}]
     out = cc.compile_context("contribution model validation gate", "reasoning",
-                             prior_sources=prior)
+                             prior_excerpts=prior_excerpts)
     names = [Path(s).name for s in out["sources"]]
     # Fresh search found WO_HXQ at ≥2 (strong), but carry-forward still
     # reserves one slot for the prior receipt
@@ -321,7 +326,7 @@ def test_prompt_tokens_use_full_context_not_uncached_slice(orch_config, monkeypa
     assert g["max_prompt_tokens"] == 1582
 
 
-def test_orchestrator_threads_prior_sources_across_turns(orch_config, monkeypatch, receipts):
+def test_orchestrator_threads_prior_excerpts_across_turns(orch_config, monkeypatch, receipts):
     from cell.orchestrator import Orchestrator
     monkeypatch.setenv("CELL_CONTEXT_COMPILER", "1")
     captured = {}
@@ -332,7 +337,8 @@ def test_orchestrator_threads_prior_sources_across_turns(orch_config, monkeypatc
 
     r1 = o.process("hxq af6 benchmark quadro t2000", force_model="m")
     assert r1["context_compiled"]["sources"]
-    assert o._prior_sources
+    assert o._prior_excerpts
+    assert all("excerpt" in e for e in o._prior_excerpts)
     hist = [{"role": "user", "content": "hxq af6 benchmark"},
             {"role": "assistant", "content": "found the AF6 receipt and read it"}]
     r2 = o.process("what were the tokens per second?", force_model="m", history=hist)
@@ -341,7 +347,7 @@ def test_orchestrator_threads_prior_sources_across_turns(orch_config, monkeypatc
     assert "tg128" in captured["user_input"]
 
     o.reset_session()
-    assert o._prior_sources == []
+    assert o._prior_excerpts == []
 
 
 # ---------------------------------------------------------------------------
@@ -538,14 +544,36 @@ def test_error_results_excluded_from_no_new_info(orch_config, monkeypatch):
 
 def test_carry_forward_skips_when_prior_already_in_fresh_results(receipts):
     """When prior source is already found by fresh search, carry doesn't duplicate."""
-    prior = [str(receipts / "hxq_af6_mmq_phase0" / "phase0_receipt.json")]
+    phase0_path = str(receipts / "hxq_af6_mmq_phase0" / "phase0_receipt.json")
+    prior_excerpts = [{"path": phase0_path,
+                       "name": "phase0_receipt.json",
+                       "excerpt": "File: phase0_receipt.json\ntitle: AF6 phase 0"}]
     # "hxq" in query → phase0's dir scores 1 → phase0 already in fresh results
     out = cc.compile_context("hxq contribution model validation", "reasoning",
-                             prior_sources=prior)
+                             prior_excerpts=prior_excerpts)
     # No carry needed — prior is already found by fresh search
     assert not any(s["type"] == "carry_forward" for s in out["searches"])
     # But the prior source still appears (via fresh search, not carry)
     assert any("phase0" in s for s in out["sources"])
+
+
+def test_carried_excerpt_is_byte_identical_across_turns(receipts):
+    """The whole point of storing excerpts: the carried receipt text in T2's
+    evidence block is byte-identical to T1's, so llama-server's prefix cache
+    covers it."""
+    t1 = cc.compile_context("hxq af6 benchmark quadro t2000", "reasoning")
+    assert t1["excerpts"]
+    # The evidence block for T1 starts with the receipt
+    t1_prefix = t1["evidence"].split("\n\n")[0]  # first receipt block
+
+    # T2: carry T1's excerpts forward (weak fresh search)
+    t2 = cc.compile_context("what were the tokens per second?", "reasoning",
+                            history_summary="Q: hxq af6\nA: found it\n",
+                            prior_excerpts=t1["excerpts"])
+    t2_prefix = t2["evidence"].split("\n\n")[0]  # first receipt block
+
+    assert t1_prefix == t2_prefix, (
+        f"Carried excerpt prefix differs!\nT1: {t1_prefix[:200]}\nT2: {t2_prefix[:200]}")
 
 
 def test_evidence_hint_appended_when_compiler_has_sources(orch_config, monkeypatch, receipts):

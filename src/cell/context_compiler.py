@@ -42,25 +42,26 @@ FGIP_DB = os.path.expanduser("~/fgip-engine/fgip.db")
 def compile_context(question: str, intent: str,
                     history_summary: str = "",
                     token_budget: int = 1200,
-                    prior_sources: Optional[list[str]] = None) -> dict:
+                    prior_excerpts: Optional[list[dict]] = None) -> dict:
     """Search for evidence relevant to the question and build a compact context.
 
-    prior_sources: receipt paths read on the previous turn. Used only as a
-        fallback when this turn's own search is empty or weak (top score
-        < CARRY_FORWARD_BELOW), which is what a follow-up question looks
-        like ("what were the tokens per second?" has no receipt keywords).
+    prior_excerpts: receipt excerpts from the previous turn, each a dict with
+        ``{"path": str, "name": str, "excerpt": str}``.  The stored excerpt
+        text is reused verbatim on carry-forward so the byte prefix of the
+        evidence block is identical across turns (enabling llama-server's
+        prompt cache).
 
     Returns:
         {
             "evidence": str,       # formatted evidence block for the prompt
             "sources": list[str],  # file paths / sources used
             "tokens_est": int,     # estimated token count
-            "searches": list[dict] # what was searched and found
+            "searches": list[dict],# what was searched and found
+            "excerpts": list[dict] # [{path, name, excerpt}] for next turn
         }
     """
     char_budget = token_budget * CHARS_PER_TOKEN
     searches = []
-    evidence_parts = []
     sources = []
 
     # Extract search terms from the question
@@ -75,26 +76,25 @@ def compile_context(question: str, intent: str,
     #
     #     Two modes:
     #       - Weak fresh search (top score < CARRY_FORWARD_BELOW): carry ALL
-    #         prior sources to the front (they become the primary evidence).
+    #         prior excerpts (they become the primary evidence).
     #       - Decent fresh search: still reserve ONE slot for the best prior
-    #         source so T3 follow-ups don't lose the receipt they're about
+    #         excerpt so T3 follow-ups don't lose the receipt they're about
     #         when generic words like "baseline" or "receipt" score 1–2 on
     #         wrong files.
-    if prior_sources:
+    carried_excerpts: list[dict] = []
+    if prior_excerpts:
         weak_fresh = not receipt_hits or receipt_hits[0]["score"] < CARRY_FORWARD_BELOW
         seen = {h["path"] for h in receipt_hits}
-        carried = []
-        for p in prior_sources:
-            if p in seen or not os.path.isfile(p):
+        for exc in prior_excerpts:
+            p = exc["path"]
+            if p in seen:
                 continue
-            carried.append({"path": p, "name": os.path.basename(p),
-                            "score": 0, "size": os.path.getsize(p),
-                            "carried": True})
+            carried_excerpts.append(exc)
             if not weak_fresh:
                 break  # reserve only one slot when fresh search is decent
-        if carried:
-            receipt_hits = carried + receipt_hits
-            searches.append({"type": "carry_forward", "hits": len(carried)})
+        if carried_excerpts:
+            searches.append({"type": "carry_forward",
+                             "hits": len(carried_excerpts)})
 
     # 2. Search FGIP claims if DB exists
     fgip_hits = _search_fgip(keywords)
@@ -111,19 +111,38 @@ def compile_context(question: str, intent: str,
     fgip_budget = int(char_budget * 0.2)
     memory_budget = int(char_budget * 0.2)
 
-    # 4. Read and extract from the top receipt matches.
-    #    Files in the same family (bench_*_run17, run14, ...) are collapsed to
-    #    their newest member first, so a run series can't crowd out a
-    #    lower-scoring but distinct receipt such as phase0_receipt.json.
+    # ── Assemble evidence in cache-prefix order ──
+    #
+    # Carried excerpts go FIRST (byte-identical to last turn's prefix) so
+    # llama-server's prompt cache covers them on T2/T3.  Fresh receipts,
+    # FGIP, memory, and history follow — they vary between turns and belong
+    # at the tail where cache misses are cheapest.
+    evidence_parts: list[str] = []
+    excerpts_out: list[dict] = []  # stored for next turn's carry-forward
+
+    # 4a. Carried excerpts — verbatim, no re-read.
+    for exc in carried_excerpts:
+        evidence_parts.append(f"[Receipt: {exc['name']}]\n{exc['excerpt']}")
+        sources.append(exc["path"])
+        excerpts_out.append(exc)
+        receipt_budget -= len(exc["excerpt"])
+
+    # 4b. Fresh receipts — read and store excerpt text.
+    #     Families are deduped; carried paths are excluded.
     if receipt_hits:
-        picks = _dedupe_families(receipt_hits)[:MAX_RECEIPTS]
-        remaining = receipt_budget
+        carried_paths = {e["path"] for e in carried_excerpts}
+        fresh_hits = [h for h in receipt_hits if h["path"] not in carried_paths]
+        picks = _dedupe_families(fresh_hits)[:MAX_RECEIPTS - len(carried_excerpts)]
+        remaining = max(0, receipt_budget)
         for i, hit in enumerate(picks):
-            share = remaining // (len(picks) - i)
+            share = remaining // (len(picks) - i) if picks else 0
             excerpt = _read_receipt_compact(hit["path"], share)
             if excerpt:
                 evidence_parts.append(f"[Receipt: {hit['name']}]\n{excerpt}")
                 sources.append(hit["path"])
+                excerpts_out.append({"path": hit["path"],
+                                     "name": hit["name"],
+                                     "excerpt": excerpt})
                 remaining -= len(excerpt)
             if remaining < 200:
                 break
@@ -146,13 +165,8 @@ def compile_context(question: str, intent: str,
             evidence_parts.append(f"[Memory]\n{mem_text}")
             sources.append("memory")
 
-    # 7. Assemble
-    evidence = "\n\n".join(evidence_parts) if evidence_parts else ""
-
-    # 8. Add history summary if present.
-    #    history_summary is chronological (oldest turn first). When it exceeds
-    #    the cap we must keep the TAIL — the most recent turns — and drop the
-    #    oldest. Cutting at a line boundary so no half-turn leaks in.
+    # 7. History summary LAST — it changes every turn and belongs at the
+    #    tail where a cache miss costs the least.
     if history_summary:
         history_cap = int(char_budget * 0.15)
         kept = history_summary.rstrip("\n")
@@ -166,9 +180,10 @@ def compile_context(question: str, intent: str,
             if 0 <= cut < len(kept) - 1:
                 kept = kept[cut + 1:]
             kept = "... (earlier turns dropped)\n" + kept
-        evidence = f"[Prior context]\n{kept}\n\n{evidence}"
+        evidence_parts.append(f"[Prior context]\n{kept}")
 
-    # Trim to budget
+    # 8. Assemble and trim
+    evidence = "\n\n".join(evidence_parts) if evidence_parts else ""
     if len(evidence) > char_budget:
         evidence = evidence[:char_budget - 20] + "\n... (trimmed)"
 
@@ -179,6 +194,7 @@ def compile_context(question: str, intent: str,
         "sources": sources,
         "tokens_est": tokens_est,
         "searches": searches,
+        "excerpts": excerpts_out,
     }
 
 
