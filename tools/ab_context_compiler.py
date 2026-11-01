@@ -209,6 +209,12 @@ def _start_server(config: dict, model: str,
     cmd = [binary, "--model", gguf, "--port", port,
            "--ctx-size", str(gen.get("num_ctx", 4096)),
            "--n-gpu-layers", "99", "--host", "127.0.0.1"]
+    cache_k = gen.get("cache_type_k")
+    cache_v = gen.get("cache_type_v")
+    if cache_k:
+        cmd.extend(["--cache-type-k", cache_k])
+    if cache_v:
+        cmd.extend(["--cache-type-v", cache_v])
     if extra_args:
         cmd.extend(extra_args.split())
     proc = subprocess.Popen(
@@ -228,11 +234,13 @@ def _start_server(config: dict, model: str,
 # ---------------------------------------------------------------------------
 def run_mode(mode: str, config_path: str, scenarios: list[dict],
              use_tools: bool, depth: int) -> list[dict]:
-    # compiler600 = compiler with half budget (600 tokens evidence)
+    # compiler<N> = compiler with N-token evidence budget
     if mode.startswith("compiler"):
         os.environ["CELL_CONTEXT_COMPILER"] = "1"
         if mode == "compiler600":
             os.environ["CELL_CONTEXT_BUDGET"] = "600"
+        elif mode == "compiler3000":
+            os.environ["CELL_CONTEXT_BUDGET"] = "3000"
         elif "CELL_CONTEXT_BUDGET" in os.environ:
             del os.environ["CELL_CONTEXT_BUDGET"]
     else:

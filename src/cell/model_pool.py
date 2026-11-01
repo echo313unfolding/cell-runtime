@@ -223,13 +223,22 @@ class ModelPool:
         if lib_dir:
             env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
 
+        cmd = [llama_server,
+               "--model", gguf_path,
+               "--port", port,
+               "--ctx-size", str(gen_cfg["n_ctx"]),
+               "--n-gpu-layers", str(gen_cfg["n_gpu_layers"]),
+               "--host", "127.0.0.1"]
+        # KV cache quantization — halves KV memory, enabling 16k on 4GB
+        cache_k = self.generation.get("cache_type_k")
+        cache_v = self.generation.get("cache_type_v")
+        if cache_k:
+            cmd.extend(["--cache-type-k", cache_k])
+        if cache_v:
+            cmd.extend(["--cache-type-v", cache_v])
+
         self._llama_proc = subprocess.Popen(
-            [llama_server,
-             "--model", gguf_path,
-             "--port", port,
-             "--ctx-size", str(gen_cfg["n_ctx"]),
-             "--n-gpu-layers", str(gen_cfg["n_gpu_layers"]),
-             "--host", "127.0.0.1"],
+            cmd,
             stdout=open(log_path, "w"),
             stderr=subprocess.STDOUT,
             env=env,
