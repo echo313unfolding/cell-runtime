@@ -249,6 +249,31 @@ def infer_almanac_query(user_text: str) -> str | None:
     return None
 
 
+def _query_mentioned_in_text(query: str, text: str) -> bool:
+    """Check if the query type is explicitly mentioned in the user's text.
+
+    Used to protect valid subqueries in combined requests. If the user
+    said "show top channels and signal quality", both top_channels and
+    signal_quality are valid — the model should be allowed to call either
+    without the correction system overriding it.
+    """
+    import re
+    text_lower = text.lower()
+    if query == "top_channels":
+        return bool(re.search(
+            r'\b(top|most|favorite|best)\b.*\b(channels?|watch)', text_lower))
+    if query == "signal_quality":
+        return bool(re.search(r'\bsignal.?quality\b', text_lower))
+    if query == "recency":
+        return bool(re.search(
+            r'\b(recent|recen|when|year|timeline)\b.*\b(watch|view|viewing|history)\b',
+            text_lower))
+    if query.startswith("channel:"):
+        channel_name = query[len("channel:"):].strip()
+        return channel_name in text_lower
+    return False
+
+
 class AlmanacEvidenceAgent(AgentBase):
     """Query the latest almanac evidence table for member-facing answers.
 
@@ -256,10 +281,12 @@ class AlmanacEvidenceAgent(AgentBase):
     returns structured answers. The LLM uses this to explain the data
     to the member in natural language.
 
-    When user_question is provided, the agent uses deterministic query
-    inference (infer_almanac_query) to select the right query, overriding
-    the model's query parameter. This makes channel lookups reliable
-    regardless of 3B model variance.
+    Query correction: when _trusted_user_question is set by the
+    orchestrator (not by the model), infer_almanac_query extracts the
+    intended query from the raw question. This only overrides the
+    model's query when inference is confident (returns non-None) AND
+    the model's query doesn't already match. The model's query is
+    preserved when inference is ambiguous.
     """
     name = "almanac_evidence"
     description = (
@@ -281,27 +308,39 @@ class AlmanacEvidenceAgent(AgentBase):
                     "'recency', 'channel:<name>'"
                 ),
             },
-            "user_question": {
-                "type": "string",
-                "description": (
-                    "The member's original question (used for deterministic "
-                    "query selection when query is ambiguous)."
-                ),
-            },
         },
         "required": ["query"],
     }
 
     def execute(self, args: dict) -> AgentResult:
-        query = args["query"].strip().lower()
-        user_question = args.get("user_question", "")
+        requested_query = args["query"].strip().lower()
+        query = requested_query
+        correction = None
 
-        # Deterministic override: if user_question is provided, infer the
-        # correct query and use it instead of what the model chose.
-        if user_question:
-            inferred = infer_almanac_query(user_question)
+        # _trusted_user_question is set by the orchestrator from the raw
+        # user input (before augmentation). It is never set by the model.
+        # Any model-supplied "user_question" arg is ignored.
+        trusted_question = args.get("_trusted_user_question", "")
+        if trusted_question:
+            inferred = infer_almanac_query(trusted_question)
             if inferred and inferred != query:
-                query = inferred
+                # Before overriding: check if the model's query is a valid
+                # subquery that the user explicitly mentioned. A combined
+                # request like "show top channels and signal quality" should
+                # let the model's signal_quality call through even though
+                # inference picks top_channels as the primary.
+                model_query_valid = _query_mentioned_in_text(
+                    query, trusted_question)
+                if model_query_valid:
+                    # Model's query is valid for this user text — don't override.
+                    pass
+                else:
+                    correction = {
+                        "requested": requested_query,
+                        "executed": inferred,
+                        "reason": "deterministic override from raw user question",
+                    }
+                    query = inferred
         evidence_path = EVIDENCE_DIR / "latest_evidence_table.json"
 
         if not evidence_path.exists():
@@ -311,12 +350,20 @@ class AlmanacEvidenceAgent(AgentBase):
         data = json.loads(evidence_path.read_text())
         attrs = data.get("attributes", [])
 
+        output = self._run_query(query, data, attrs)
+        if correction:
+            output["correction"] = correction
+        return AgentResult(output=output)
+
+    @staticmethod
+    def _run_query(query: str, data: dict, attrs: list) -> dict:
+        """Execute a single query against the evidence table."""
         if query == "top_channels":
             channels = [a for a in attrs
                         if a["attribute_name"] == "interest_channel_affinity"]
             channels.sort(
                 key=lambda a: -a["typed_value"]["quality_weighted_score"])
-            return AgentResult(output={
+            return {
                 "query": query,
                 "total_records": data.get("total_records"),
                 "results": [
@@ -326,27 +373,25 @@ class AlmanacEvidenceAgent(AgentBase):
                      "avg_quality": a["typed_value"]["avg_signal_quality"]}
                     for a in channels[:15]
                 ],
-            })
+            }
 
         if query == "signal_quality":
             for a in attrs:
                 if a["attribute_name"] == "signal_quality_distribution":
-                    return AgentResult(output={
+                    return {
                         "query": query,
                         "distribution": a["typed_value"],
-                    })
-            return AgentResult(
-                error="No signal quality distribution in evidence table.")
+                    }
+            return {"query": query, "error": "No signal quality distribution in evidence table."}
 
         if query == "recency":
             for a in attrs:
                 if a["attribute_name"] == "activity_recency":
-                    return AgentResult(output={
+                    return {
                         "query": query,
                         "year_distribution": a["typed_value"],
-                    })
-            return AgentResult(
-                error="No activity recency in evidence table.")
+                    }
+            return {"query": query, "error": "No activity recency in evidence table."}
 
         if query.startswith("channel:"):
             channel_name = query[len("channel:"):].strip()
@@ -357,12 +402,12 @@ class AlmanacEvidenceAgent(AgentBase):
                 if channel_name in a["typed_value"]["channel"].lower()
             ]
             if not matches:
-                return AgentResult(output={
+                return {
                     "query": query,
                     "results": [],
                     "note": "No matching channel found.",
-                })
-            return AgentResult(output={
+                }
+            return {
                 "query": query,
                 "results": [
                     {"channel": a["typed_value"]["channel"],
@@ -371,12 +416,12 @@ class AlmanacEvidenceAgent(AgentBase):
                      "avg_quality": a["typed_value"]["avg_signal_quality"]}
                     for a in matches
                 ],
-            })
+            }
 
-        return AgentResult(output={
+        return {
             "query": query,
             "error": (
                 "Unknown query. Use: top_channels, signal_quality, "
                 "recency, channel:<name>"
             ),
-        })
+        }

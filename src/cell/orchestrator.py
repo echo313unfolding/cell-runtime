@@ -263,7 +263,8 @@ class Orchestrator:
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
                   history: list = None, tool_registry: ToolRegistry = None,
                   system_hint: str = "", num_predict_override: int = None,
-                  system_prompt_override: str = None) -> dict:
+                  system_prompt_override: str = None,
+                  raw_user_input: str = None) -> dict:
         """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
 
         Args:
@@ -274,6 +275,10 @@ class Orchestrator:
             system_hint: Extra text appended to the system prompt (e.g., evidence hint).
             num_predict_override: If set, overrides generation.num_predict for this call.
             system_prompt_override: If set, replaces the model's default system prompt.
+            raw_user_input: The original user question before augmentation.
+                            Passed as trusted execution context to agents that
+                            need it (e.g., almanac_evidence query correction).
+                            Never derived from the augmented prompt.
         """
         active_registry = tool_registry or self.tool_registry
         backend = self._backend_for(model)
@@ -460,11 +465,15 @@ class Orchestrator:
                     })
                     continue
 
-                # Inject user_question for almanac_evidence so the agent
-                # can deterministically select the right query parameter
-                # regardless of what the 3B model chose.
-                if tool_name == "almanac_evidence" and "user_question" not in tool_args:
-                    tool_args["user_question"] = user_input
+                # Inject trusted execution context for almanac_evidence.
+                # raw_user_input is the member's original question before
+                # augmentation (no evidence block, no prior context).
+                # Uses _trusted_ prefix so the agent can distinguish it
+                # from model-supplied arguments. Any model-supplied
+                # "user_question" or "_trusted_user_question" is ignored.
+                if tool_name == "almanac_evidence" and raw_user_input:
+                    tool_args.pop("user_question", None)
+                    tool_args["_trusted_user_question"] = raw_user_input
 
                 tool_result = active_registry.execute(tool_name, tool_args)
 
@@ -789,7 +798,8 @@ class Orchestrator:
                                     history=gen_history, tool_registry=active_reg,
                                     system_hint=sys_hint,
                                     num_predict_override=num_predict_override,
-                                    system_prompt_override=sys_prompt_override)
+                                    system_prompt_override=sys_prompt_override,
+                                    raw_user_input=user_input)
 
         # 9. Feed result to memory lane
         self.memory.ingest({
