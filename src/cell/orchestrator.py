@@ -465,15 +465,16 @@ class Orchestrator:
                     })
                     continue
 
-                # Inject trusted execution context for almanac_evidence.
-                # raw_user_input is the member's original question before
-                # augmentation (no evidence block, no prior context).
-                # Uses _trusted_ prefix so the agent can distinguish it
-                # from model-supplied arguments. Any model-supplied
-                # "user_question" or "_trusted_user_question" is ignored.
-                if tool_name == "almanac_evidence" and raw_user_input:
+                # Sanitize and inject trusted execution context for
+                # almanac_evidence. Always strip model-supplied context
+                # fields — even when raw_user_input is absent (e.g.,
+                # direct _generate() callers), forged fields must not
+                # reach the agent. Only inject trusted when we have it.
+                if tool_name == "almanac_evidence":
                     tool_args.pop("user_question", None)
-                    tool_args["_trusted_user_question"] = raw_user_input
+                    tool_args.pop("_trusted_user_question", None)
+                    if raw_user_input is not None:
+                        tool_args["_trusted_user_question"] = raw_user_input
 
                 tool_result = active_registry.execute(tool_name, tool_args)
 

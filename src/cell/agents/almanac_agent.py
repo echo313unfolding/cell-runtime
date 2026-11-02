@@ -353,7 +353,7 @@ class AlmanacEvidenceAgent(AgentBase):
         output = self._run_query(query, data, attrs)
         if correction:
             output["correction"] = correction
-        return AgentResult(output=output)
+        return AgentResult(output=output, error=output.get("error"))
 
     @staticmethod
     def _run_query(query: str, data: dict, attrs: list) -> dict:
