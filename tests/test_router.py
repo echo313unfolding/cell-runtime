@@ -52,6 +52,11 @@ CASES = [
     ("how often do I watch news channels", "almanac"),
     ("my youtube watch history analysis", "almanac"),
 
+    # ── almanac: first-person watched (regression for case-sensitivity fix) ──
+    ("I've watched so much youtube lately", "almanac"),
+    ("have I watched any cooking channels", "almanac"),
+    ("I have watched a lot of Lex Fridman on youtube", "almanac"),
+
     # ── general (no strong signal) ──
     ("what time is it in Tokyo", "general"),
     ("summarize this paragraph for me", "general"),
@@ -61,6 +66,7 @@ CASES = [
     # "watch for memory leaks" has no coding keywords — general is defensible
     ("how often should I watch for memory leaks", "general"),
     ("watch the build output for errors", "coding"),
+    ("Have you watched for memory leaks in the daemon", "general"),
 ]
 
 

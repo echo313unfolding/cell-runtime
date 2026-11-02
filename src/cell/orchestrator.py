@@ -460,6 +460,12 @@ class Orchestrator:
                     })
                     continue
 
+                # Inject user_question for almanac_evidence so the agent
+                # can deterministically select the right query parameter
+                # regardless of what the 3B model chose.
+                if tool_name == "almanac_evidence" and "user_question" not in tool_args:
+                    tool_args["user_question"] = user_input
+
                 tool_result = active_registry.execute(tool_name, tool_args)
 
                 # No-new-info: identical result from different call.

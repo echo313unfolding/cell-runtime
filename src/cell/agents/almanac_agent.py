@@ -184,12 +184,82 @@ class AlmanacNormalizeAgent(AgentBase):
         )
 
 
+def infer_almanac_query(user_text: str) -> str | None:
+    """Deterministic query selection from user input for almanac_evidence.
+
+    The 3B model sometimes picks the wrong query parameter (e.g.,
+    signal_quality when the user asked about a specific channel). This
+    function extracts the right query from the user's natural language
+    so the mechanism doesn't depend on model tool-arg selection.
+
+    Returns a query string like 'channel:lex fridman', 'top_channels',
+    'signal_quality', 'recency', or None if ambiguous.
+    """
+    text = user_text.lower()
+
+    # Channel-specific: "how much do I watch X", "my X viewing", etc.
+    # Look for a quoted or named entity after watch/channel keywords.
+    import re
+
+    # Pattern: "watch <channel_name> on youtube" or "<channel_name> channel"
+    # or "how much/many/often ... <channel_name>"
+    channel_patterns = [
+        # "watch Lex Fridman on youtube"
+        r'\bwatch\b\s+(.+?)\s+(?:on\s+)?(?:youtube|yt)\b',
+        # "watched NetworkChuck" / "I've watched NetworkChuck"
+        r'\bwatched\s+([A-Z][\w\s]{1,30}?)(?:\s+on|\s*$|\s*\?)',
+        # "how much do I watch Lex Fridman"
+        r'\bhow\s+(?:much|many|often)\b.*\bwatch\s+([A-Z][\w\s]{1,30}?)(?:\s+on|\s*$|\s*\?)',
+    ]
+    # Filler words between "watched" and the channel name
+    _FILLER = {'so', 'so much', 'a lot of', 'too much', 'lots of', 'tons of'}
+
+    for pat in channel_patterns:
+        m = re.search(pat, user_text, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip().rstrip('?.,!')
+            # Strip filler phrases (e.g., "watched so much 3Blue1Brown")
+            name_lower = name.lower()
+            for filler in sorted(_FILLER, key=len, reverse=True):
+                if name_lower.startswith(filler + ' '):
+                    name = name[len(filler):].strip()
+                    name_lower = name.lower()
+                    break
+            # Filter out generic words that aren't channel names
+            first_word = name_lower.split()[0] if name.strip() else ""
+            if first_word not in ('youtube', 'channel', 'channels', 'the',
+                                  'my', 'for', 'on', 'news', 'cooking',
+                                  'a', 'an', 'it', 'if', 'at', 'to'):
+                return f"channel:{name_lower}"
+
+    # Top channels
+    if re.search(r'\b(top|most|favorite|best)\b.*\b(channels?|watch)', text):
+        return "top_channels"
+    if re.search(r'\bchannels?\b.*\b(top|most|favorite|best|watch)\b', text):
+        return "top_channels"
+
+    # Signal quality
+    if re.search(r'\bsignal.?quality\b', text):
+        return "signal_quality"
+
+    # Recency
+    if re.search(r'\b(recent|recen|when|year|timeline)\b.*\b(watch|view|viewing|history)\b', text):
+        return "recency"
+
+    return None
+
+
 class AlmanacEvidenceAgent(AgentBase):
     """Query the latest almanac evidence table for member-facing answers.
 
     Reads the pre-computed evidence table (from almanac_normalize) and
     returns structured answers. The LLM uses this to explain the data
     to the member in natural language.
+
+    When user_question is provided, the agent uses deterministic query
+    inference (infer_almanac_query) to select the right query, overriding
+    the model's query parameter. This makes channel lookups reliable
+    regardless of 3B model variance.
     """
     name = "almanac_evidence"
     description = (
@@ -211,12 +281,27 @@ class AlmanacEvidenceAgent(AgentBase):
                     "'recency', 'channel:<name>'"
                 ),
             },
+            "user_question": {
+                "type": "string",
+                "description": (
+                    "The member's original question (used for deterministic "
+                    "query selection when query is ambiguous)."
+                ),
+            },
         },
         "required": ["query"],
     }
 
     def execute(self, args: dict) -> AgentResult:
         query = args["query"].strip().lower()
+        user_question = args.get("user_question", "")
+
+        # Deterministic override: if user_question is provided, infer the
+        # correct query and use it instead of what the model chose.
+        if user_question:
+            inferred = infer_almanac_query(user_question)
+            if inferred and inferred != query:
+                query = inferred
         evidence_path = EVIDENCE_DIR / "latest_evidence_table.json"
 
         if not evidence_path.exists():

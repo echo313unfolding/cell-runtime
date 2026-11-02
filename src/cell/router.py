@@ -91,8 +91,8 @@ ALMANAC_PATTERNS = [
     r'\b(channels?)\b.*\b(watch|most|top|favorite)\b',
     r'\b(watch|watched)\b.*\bchannels?\b',
     r'\bhow\s+(much|many|often)\b.*\b(watch|watched)\b.*\b(youtube|channel)\b',
-    r'\b(I|I\'ve)\s+watched\b',
-    r'\bhave\b.*\bwatched\b',
+    r'\b(i|i\'ve)\s+watched\b',
+    r'\bi\b.*\bhave\b.*\bwatched\b',
 ]
 
 
