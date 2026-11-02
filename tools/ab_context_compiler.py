@@ -32,13 +32,16 @@ Receipt: ~/receipts/cell/echo_context_compiler_ab_v2_<UTC stamp>.json
 from __future__ import annotations
 
 import argparse
+import ast
 import collections
 import statistics
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -174,6 +177,187 @@ def _hit(gold: list[str], result: dict) -> bool | None:
 
 
 # ---------------------------------------------------------------------------
+# Coding output scorer
+# ---------------------------------------------------------------------------
+def _extract_python_block(text: str) -> str | None:
+    """Extract the first fenced code block from model output.
+
+    Accepts ```python, ```py, or bare ```.  Tolerates missing closing
+    fence (model hit num_predict before emitting it).
+    """
+    m = re.search(r'```(?:python|py)?\s*\n(.*?)(?:```|$)', text, re.DOTALL)
+    if not m:
+        return None
+    code = m.group(1).strip()
+    return code if code else None
+
+
+def _score_coding_t1(output: str) -> dict:
+    """T1: extract function, ast.parse, exec, call on fixture, assert dict.
+    Returns {"code_score": 0-3, "detail": str}."""
+    code = _extract_python_block(output)
+    if not code:
+        return {"code_score": 0, "detail": "no ```python block found"}
+
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        return {"code_score": 1, "detail": f"syntax error: {e}"}
+
+    # Run in subprocess with fixture
+    fixture = json.dumps([
+        {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2},
+        {"model_filename": "zamba2.gguf", "test": "tg128", "avg_ts": 37.4},
+    ])
+    test_script = (
+        f"{code}\n\n"
+        f"import json, sys\n"
+        f"data = json.loads({fixture!r})\n"
+        f"# Find the function name — first def at module level\n"
+        f"import types\n"
+        f"funcs = [v for v in dir() if callable(eval(v)) and not v.startswith('_') and isinstance(eval(v), types.FunctionType)]\n"
+        f"assert funcs, 'no function found'\n"
+        f"fn = eval(funcs[0])\n"
+        f"# Try calling with the list\n"
+        f"result = fn(data)\n"
+        f"assert isinstance(result, dict), f'expected dict, got {{type(result).__name__}}'\n"
+        f"assert 'pp512' in result or 'tg128' in result, f'expected test names in keys, got {{list(result.keys())}}'\n"
+        f"print('PASS')\n"
+    )
+    return _run_code_subprocess(test_script, code, "T1")
+
+
+def _score_coding_t2(output: str, t1_code: str) -> dict:
+    """T2: same as T1 + single-dict case + type annotation check.
+    Returns {"code_score": 0-3, "detail": str}."""
+    code = _extract_python_block(output)
+    if not code:
+        return {"code_score": 0, "detail": "no ```python block found"}
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return {"code_score": 1, "detail": f"syntax error: {e}"}
+
+    # Check for type annotations on the first function def
+    has_annotations = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            if node.returns or any(a.annotation for a in node.args.args):
+                has_annotations = True
+            break
+
+    fixture_list = json.dumps([
+        {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2},
+        {"model_filename": "zamba2.gguf", "test": "tg128", "avg_ts": 37.4},
+    ])
+    fixture_single = json.dumps(
+        {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2}
+    )
+    test_script = (
+        f"{code}\n\n"
+        f"import json, sys, types\n"
+        f"funcs = [v for v in dir() if callable(eval(v)) and not v.startswith('_') and isinstance(eval(v), types.FunctionType)]\n"
+        f"assert funcs, 'no function found'\n"
+        f"fn = eval(funcs[0])\n"
+        f"# List case\n"
+        f"r1 = fn(json.loads({fixture_list!r}))\n"
+        f"assert isinstance(r1, dict), f'list case: expected dict, got {{type(r1).__name__}}'\n"
+        f"# Single-dict case\n"
+        f"r2 = fn(json.loads({fixture_single!r}))\n"
+        f"assert isinstance(r2, dict), f'single case: expected dict, got {{type(r2).__name__}}'\n"
+        f"print('PASS')\n"
+    )
+    result = _run_code_subprocess(test_script, code, "T2")
+    if result["code_score"] == 3 and not has_annotations:
+        result["code_score"] = 2
+        result["detail"] += "; missing type annotations"
+    return result
+
+
+def _score_coding_t3(output: str, t1_code: str) -> dict:
+    """T3: extract pytest block, write both to temp dir, run pytest.
+    Returns {"code_score": 0-3, "detail": str}."""
+    test_code = _extract_python_block(output)
+    if not test_code:
+        return {"code_score": 0, "detail": "no ```python block found"}
+
+    try:
+        ast.parse(test_code)
+    except SyntaxError as e:
+        return {"code_score": 1, "detail": f"syntax error in test: {e}"}
+
+    if not t1_code:
+        return {"code_score": 1, "detail": "no T1 function code to test against"}
+
+    with tempfile.TemporaryDirectory(prefix="cell_coding_") as td:
+        # Write the module under test
+        mod_path = os.path.join(td, "parse_bench.py")
+        with open(mod_path, "w") as f:
+            f.write(t1_code)
+
+        # Write the test file, patching imports to find the module
+        test_path = os.path.join(td, "test_parse_bench.py")
+        with open(test_path, "w") as f:
+            f.write(f"import sys; sys.path.insert(0, {td!r})\n")
+            f.write(test_code)
+
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "pytest", test_path, "-q", "--tb=short", "--no-header"],
+                capture_output=True, text=True, timeout=30,
+                cwd=td,
+            )
+            if r.returncode == 0:
+                return {"code_score": 3, "detail": f"pytest PASS: {r.stdout.strip()[-120:]}"}
+            else:
+                detail = (r.stdout + r.stderr).strip()[-200:]
+                return {"code_score": 2, "detail": f"pytest FAIL: {detail}"}
+        except subprocess.TimeoutExpired:
+            return {"code_score": 1, "detail": "pytest timed out (30s)"}
+        except Exception as e:
+            return {"code_score": 1, "detail": f"pytest error: {e}"}
+
+
+def _run_code_subprocess(script: str, code: str, label: str) -> dict:
+    """Execute a test script in a subprocess with 30s timeout."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(script)
+        f.flush()
+        script_path = f.name
+    try:
+        r = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0 and "PASS" in r.stdout:
+            return {"code_score": 3, "detail": f"{label} PASS"}
+        else:
+            detail = (r.stdout + r.stderr).strip()[-200:]
+            return {"code_score": 2, "detail": f"{label} exec fail: {detail}"}
+    except subprocess.TimeoutExpired:
+        return {"code_score": 1, "detail": f"{label} timed out (30s)"}
+    except Exception as e:
+        return {"code_score": 1, "detail": f"{label} error: {e}"}
+    finally:
+        os.unlink(script_path)
+
+
+def _score_coding_turn(scenario_id: str, turn: int, output: str,
+                       t1_code: str | None) -> dict | None:
+    """Score a coding scenario turn. Returns None for non-coding scenarios."""
+    if scenario_id != "coding":
+        return None
+    if turn == 1:
+        return _score_coding_t1(output)
+    elif turn == 2:
+        return _score_coding_t2(output, t1_code)
+    elif turn == 3:
+        return _score_coding_t3(output, t1_code)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # llama-server lifecycle
 # ---------------------------------------------------------------------------
 def _health(url: str) -> bool:
@@ -241,7 +425,7 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
     # compiler_syshint = hint in system prompt
     # All compiler* modes enable the compiler; anything else is legacy.
     for v in ("CELL_CONTEXT_BUDGET", "CELL_TOOLS_WHEN_EVIDENCE",
-              "CELL_HINT_IN_SYSTEM"):
+              "CELL_HINT_IN_SYSTEM", "CELL_CODING_EXEMPT"):
         os.environ.pop(v, None)
 
     if mode.startswith("compiler"):
@@ -253,8 +437,10 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
         elif mode == "compiler3000":
             os.environ["CELL_CONTEXT_BUDGET"] = "3000"
 
-        if mode == "compiler_notools":
+        if mode in ("compiler_notools", "compiler_notools_strict"):
             os.environ["CELL_TOOLS_WHEN_EVIDENCE"] = "off"
+        if mode == "compiler_notools_strict":
+            os.environ["CELL_CODING_EXEMPT"] = "0"
         if mode == "compiler_syshint":
             os.environ["CELL_HINT_IN_SYSTEM"] = "1"
     else:
@@ -312,6 +498,7 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
             history.append({"role": "assistant", "content": content})
         if skip:
             continue
+        t1_code = None  # Track T1 function code for coding scorer
         for ti, q in enumerate(sc["turns"][:depth], start=1):
             t0 = time.time()
             err = None
@@ -324,15 +511,22 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
             wall = round(time.time() - t0, 3)
             out = res.get("output", "") or ""
             deg = _degenerate(out)
+            intent = res.get("intent", "")
             first_pt = res.get("first_prompt_tokens", 0)      # full context, 1st call
             first_ev = res.get("first_prompt_evaluated", 0)   # of which uncached
             max_pt = res.get("max_prompt_tokens", 0) or first_pt
             evalc = res.get("eval_count", 0)
+
+            # Coding scorer
+            code_result = _score_coding_turn(sc["id"], ti, out, t1_code)
+            if ti == 1 and sc["id"] == "coding":
+                t1_code = _extract_python_block(out)
+
             row = {
                 "mode": mode,
                 "scenario": sc["id"],
                 "turn": ti,
-                "intent": res.get("intent"),
+                "intent": intent,
                 "error": err or res.get("error"),
                 "timings_measured": res.get("timings_measured", False),
                 "first_prompt_tokens": first_pt,
@@ -357,6 +551,8 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
                 "context_ceiling_hit": res.get("context_ceiling_hit", False),
                 "stagnation": res.get("stagnation", False),
                 "force_commit": res.get("force_commit"),
+                "code_score": code_result["code_score"] if code_result else None,
+                "code_detail": code_result["detail"] if code_result else None,
                 **deg,
             }
             rows.append(row)
@@ -365,11 +561,14 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
                 flags += " CEIL"
             if row["stagnation"]:
                 flags += " STAG"
-            print(f"[{mode:8s}] {sc['id']:26s} T{ti} "
+            code_flag = ""
+            if code_result:
+                code_flag = f" code={code_result['code_score']}/3"
+            print(f"[{mode:8s}] {sc['id']:26s} T{ti} [{intent:8s}] "
                   f"ctx={first_pt:5d} (uncached {first_ev:4d}) max={max_pt:5d} "
                   f"ev={evalc:4d} head={row['headroom']} "
                   f"deg={deg['degenerate']} hit={row['retrieval_hit']} "
-                  f"wall={wall}s{flags}"
+                  f"wall={wall}s{code_flag}{flags}"
                   f"{'ERR ' + err if err else ''}", flush=True)
             history.append({"role": "user", "content": q})
             history.append({"role": "assistant", "content": out})
@@ -421,6 +620,13 @@ def summarize(rows: list[dict]) -> dict:
             "context_ceiling_hits": sum(1 for r in rs if r.get("context_ceiling_hit")),
             "stagnation_hits": sum(1 for r in rs if r.get("stagnation")),
         }
+        # Coding scorer summary
+        code_rows = [r for r in rs if r.get("code_score") is not None]
+        if code_rows:
+            out[mode]["coding_pass"] = f"{sum(1 for r in code_rows if r['code_score'] == 3)}/{len(code_rows)}"
+            out[mode]["code_scores"] = {
+                f"T{r['turn']}": r["code_score"] for r in code_rows
+            }
     return out
 
 
@@ -428,7 +634,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(HERE.parent / "src" / "cell" / "config.json"))
-    ap.add_argument("--modes", default="legacy,compiler")
+    ap.add_argument("--modes", default="compiler,compiler_notools,compiler_notools_strict")
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--tools", choices=["on", "off"], default="on")
     ap.add_argument("--prompts", help="JSON file: list of {id, gold, turns}")
@@ -438,7 +644,7 @@ def main():
                     help="extra args passed to llama-server (e.g. '--cache-reuse 256')")
     ap.add_argument("--repeat", type=int, default=1,
                     help="run each mode N times for noise measurement (default 1)")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v6_<ts>.json)")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v7_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -483,8 +689,8 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v6_{stamp}",
-        "title": "Context compiler A/B v6 — tool-loop ablation and hint placement",
+        "receipt_id": f"echo_context_compiler_ab_v7_{stamp}",
+        "title": "Context compiler A/B v7 — coding scorer and strict notools",
         "timestamp": stamp,
         "config": args.config,
         "llama_server_url": url,
@@ -504,6 +710,8 @@ def main():
             "retrieval_hit": "any gold fragment in context_compiled.sources, tool call args/results, or output",
             "context_ceiling_hit": "tool-loop guard fired: next tool result would exceed n_ctx - margin",
             "stagnation": "tool-loop guard fired: repeated (tool,args) or identical result from different call",
+            "code_score": "coding scenario only: 0=no code block, 1=parse/timeout, 2=exec fail or missing annotations, 3=PASS",
+            "coding_pass": "N/M coding turns that scored 3 (full pass)",
         },
         "summary": summary,
         "rows": rows,
@@ -521,19 +729,27 @@ def main():
             "mean_prompt_cached_frac", "cached_frac_by_turn",
             "mean_headroom", "min_headroom",
             "mean_prompt_ms", "mean_prompt_ms_t2t3",
-            "mean_wall_s", "median_wall_s", "mean_wall_s_by_turn", "mean_tool_calls"]
+            "mean_wall_s", "median_wall_s", "mean_wall_s_by_turn", "mean_tool_calls",
+            "coding_pass", "code_scores"]
     modes = list(summary)
     col_w = max(16, max(len(m) for m in modes) + 2) if modes else 16
     print(f"{'metric':30s}" + "".join(f"{m:>{col_w}s}" for m in modes))
+    per_turn_keys = {"cached_frac_by_turn": "  cached_frac_",
+                      "mean_wall_s_by_turn": "  wall_s_",
+                      "code_scores": "  code_"}
     for k in keys:
-        if k in ("cached_frac_by_turn", "mean_wall_s_by_turn"):
-            # Expand per-turn dicts into separate rows
+        if k in per_turn_keys:
             all_turns = sorted({t for m in modes for t in summary[m].get(k, {})})
-            prefix = "  cached_frac_" if "cached" in k else "  wall_s_"
+            prefix = per_turn_keys[k]
             for t in all_turns:
                 label = f"{prefix}{t}"
                 print(f"{label:30s}" + "".join(
                     f"{str(summary[m].get(k, {}).get(t, '')):>{col_w}s}" for m in modes))
+        elif k in ("coding_pass",):
+            # Optional key — skip if no mode has it
+            if any(k in summary[m] for m in modes):
+                print(f"{k:30s}" + "".join(
+                    f"{str(summary[m].get(k, '-')):>{col_w}s}" for m in modes))
         else:
             print(f"{k:30s}" + "".join(f"{str(summary[m][k]):>{col_w}s}" for m in modes))
     print(f"\nreceipt: {out}")

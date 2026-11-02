@@ -90,6 +90,8 @@ class Orchestrator:
             ctx_cfg.get("tools_when_evidence", "on")).strip().lower()
         self.hint_in_system = os.environ.get(
             "CELL_HINT_IN_SYSTEM", "0").strip().lower() in ("1", "true", "on")
+        self.coding_exempt = os.environ.get(
+            "CELL_CODING_EXEMPT", "1").strip().lower() not in ("0", "false", "off")
 
         self.tool_registry = create_default_registry()
 
@@ -697,7 +699,7 @@ class Orchestrator:
             evidence_present = bool(receipt_sources)
             if (use_tools and evidence_present
                     and self.tools_when_evidence == "off"
-                    and intent != "coding"):
+                    and (not self.coding_exempt or intent != "coding")):
                 use_tools = False
 
             # Build augmented input: evidence FIRST, then question.
