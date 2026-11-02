@@ -118,7 +118,8 @@ DEFAULT_SCENARIOS = [
             "a dict mapping test name to avg_ts.",
             "Add type hints and handle the case where the file holds a single dict "
             "instead of a list.",
-            "Write a pytest for it with a two-entry fixture.",
+            "Write a pytest for it with a two-entry fixture. "
+            "The function lives in parse_bench.py; import it from there.",
         ],
     },
     {
@@ -225,7 +226,11 @@ def _score_coding_t1(output: str) -> dict:
         f"else:\n"
         f"    result = fn(data)\n"
         f"assert isinstance(result, dict), f'expected dict, got {{type(result).__name__}}'\n"
-        f"assert 'pp512' in result or 'tg128' in result, f'expected test names in keys, got {{list(result.keys())}}'\n"
+        f"# Accept flat {{test: ts}} or nested {{model: {{test: ts}}}}\n"
+        f"flat = result\n"
+        f"if result and isinstance(next(iter(result.values())), dict):\n"
+        f"    flat = next(iter(result.values()))\n"
+        f"assert 'pp512' in flat or 'tg128' in flat, f'expected test names in keys, got {{list(result.keys())}}'\n"
         f"print('PASS')\n"
     )
     return _run_code_subprocess(test_script, code, "T1")
@@ -682,7 +687,7 @@ def main():
                     help="extra args passed to llama-server (e.g. '--cache-reuse 256')")
     ap.add_argument("--repeat", type=int, default=1,
                     help="run each mode N times for noise measurement (default 1)")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v9_<ts>.json)")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v10_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -727,8 +732,8 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v9_{stamp}",
-        "title": "Context compiler A/B v9 — fixture fix, intent carry, coding confirmation",
+        "receipt_id": f"echo_context_compiler_ab_v10_{stamp}",
+        "title": "Context compiler A/B v10 — T1 nested-dict, T3 module name, coding gate",
         "timestamp": stamp,
         "config": args.config,
         "llama_server_url": url,
