@@ -198,14 +198,24 @@ def compile_context(question: str, intent: str,
     }
 
 
-def summarize_turn(question: str, answer: str, max_chars: int = 300) -> str:
+def summarize_turn(question: str, answer: str, max_chars: int = 300,
+                   code_cap: int = 1500) -> str:
     """Produce a compact summary of a completed turn for history injection.
 
     Pure CPU — no LLM. Extracts the key facts from the answer.
+    If the answer contains a fenced code block, preserve it verbatim
+    (capped at code_cap chars) so follow-up turns can see the code.
     """
-    # Take the first meaningful sentence(s) from the answer
+    # Check for a fenced code block — keep it verbatim for carry-forward.
+    # Require ```python or ```py (not bare ```) to avoid catching tool_call fences.
+    code_match = re.search(r'(```(?:python|py)\s*\n.*?(?:```|$))', answer, re.DOTALL)
+    if code_match:
+        code_block = code_match.group(1)[:code_cap]
+        return f"Q: {question[:100]}\nA: {code_block}"
+
+    # No code block — extract prose summary
     lines = [l.strip() for l in answer.split("\n") if l.strip()]
-    # Skip code fences and tool call blocks
+    # Skip tool call blocks
     content_lines = []
     in_block = False
     for line in lines:

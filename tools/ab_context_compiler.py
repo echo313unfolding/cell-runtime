@@ -227,11 +227,44 @@ def _score_coding_t1(output: str) -> dict:
     return _run_code_subprocess(test_script, code, "T1")
 
 
-def _score_coding_t2(output: str, t1_code: str) -> dict:
-    """T2: same as T1 + single-dict case + type annotation check.
-    Returns {"code_score": 0-3, "detail": str}."""
+def _score_coding_t2(output: str, prior_code: str) -> dict:
+    """T2: extract code, check single-dict + type annotations.
+
+    If no fenced block but prior_code already handles single-dict,
+    accept the prior as a pass (model correctly said "it already does").
+    Returns {"code_score": 0-3, "detail": str}.
+    """
     code = _extract_python_block(output)
-    if not code:
+
+    fixture_list = json.dumps([
+        {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2},
+        {"model_filename": "zamba2.gguf", "test": "tg128", "avg_ts": 37.4},
+    ])
+    fixture_single = json.dumps(
+        {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2}
+    )
+
+    # No new code block — check if the prior code already handles single-dict
+    if not code and prior_code:
+        try:
+            ast.parse(prior_code)
+        except SyntaxError:
+            return {"code_score": 0, "detail": "no new block and prior has syntax error"}
+        test_script = (
+            f"{prior_code}\n\n"
+            f"import json, sys, types\n"
+            f"funcs = [v for v in dir() if callable(eval(v)) and not v.startswith('_') and isinstance(eval(v), types.FunctionType)]\n"
+            f"assert funcs, 'no function found'\n"
+            f"fn = eval(funcs[0])\n"
+            f"r2 = fn(json.loads({fixture_single!r}))\n"
+            f"assert isinstance(r2, dict), f'single case: expected dict, got {{type(r2).__name__}}'\n"
+            f"print('PASS')\n"
+        )
+        result = _run_code_subprocess(test_script, prior_code, "T2-prior")
+        if result["code_score"] == 3:
+            return {"code_score": 2, "detail": "T2 no new block; prior already handles single-dict (accepted)"}
+        return {"code_score": 0, "detail": "no new block and prior fails single-dict"}
+    elif not code:
         return {"code_score": 0, "detail": "no ```python block found"}
 
     try:
@@ -247,13 +280,6 @@ def _score_coding_t2(output: str, t1_code: str) -> dict:
                 has_annotations = True
             break
 
-    fixture_list = json.dumps([
-        {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2},
-        {"model_filename": "zamba2.gguf", "test": "tg128", "avg_ts": 37.4},
-    ])
-    fixture_single = json.dumps(
-        {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2}
-    )
     test_script = (
         f"{code}\n\n"
         f"import json, sys, types\n"
@@ -275,8 +301,9 @@ def _score_coding_t2(output: str, t1_code: str) -> dict:
     return result
 
 
-def _score_coding_t3(output: str, t1_code: str) -> dict:
+def _score_coding_t3(output: str, prior_code: str) -> dict:
     """T3: extract pytest block, write both to temp dir, run pytest.
+    Scores against prior_code (latest code block seen, from T1 or T2).
     Returns {"code_score": 0-3, "detail": str}."""
     test_code = _extract_python_block(output)
     if not test_code:
@@ -287,14 +314,14 @@ def _score_coding_t3(output: str, t1_code: str) -> dict:
     except SyntaxError as e:
         return {"code_score": 1, "detail": f"syntax error in test: {e}"}
 
-    if not t1_code:
-        return {"code_score": 1, "detail": "no T1 function code to test against"}
+    if not prior_code:
+        return {"code_score": 1, "detail": "no prior function code to test against"}
 
     with tempfile.TemporaryDirectory(prefix="cell_coding_") as td:
         # Write the module under test
         mod_path = os.path.join(td, "parse_bench.py")
         with open(mod_path, "w") as f:
-            f.write(t1_code)
+            f.write(prior_code)
 
         # Write the test file, patching imports to find the module
         test_path = os.path.join(td, "test_parse_bench.py")
@@ -344,16 +371,19 @@ def _run_code_subprocess(script: str, code: str, label: str) -> dict:
 
 
 def _score_coding_turn(scenario_id: str, turn: int, output: str,
-                       t1_code: str | None) -> dict | None:
-    """Score a coding scenario turn. Returns None for non-coding scenarios."""
+                       prior_code: str | None) -> dict | None:
+    """Score a coding scenario turn. Returns None for non-coding scenarios.
+
+    prior_code is the latest code block seen in earlier turns (not just T1).
+    """
     if scenario_id != "coding":
         return None
     if turn == 1:
         return _score_coding_t1(output)
     elif turn == 2:
-        return _score_coding_t2(output, t1_code)
+        return _score_coding_t2(output, prior_code)
     elif turn == 3:
-        return _score_coding_t3(output, t1_code)
+        return _score_coding_t3(output, prior_code)
     return None
 
 
@@ -439,8 +469,10 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
 
         if mode in ("compiler_notools", "compiler_notools_strict"):
             os.environ["CELL_TOOLS_WHEN_EVIDENCE"] = "off"
+        if mode == "compiler_notools":
+            os.environ["CELL_CODING_EXEMPT"] = "1"  # control: exemption on
         if mode == "compiler_notools_strict":
-            os.environ["CELL_CODING_EXEMPT"] = "0"
+            os.environ["CELL_CODING_EXEMPT"] = "0"  # experiment: exemption off
         if mode == "compiler_syshint":
             os.environ["CELL_HINT_IN_SYSTEM"] = "1"
     else:
@@ -498,7 +530,7 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
             history.append({"role": "assistant", "content": content})
         if skip:
             continue
-        t1_code = None  # Track T1 function code for coding scorer
+        latest_code = None  # Track latest code block for coding scorer
         for ti, q in enumerate(sc["turns"][:depth], start=1):
             t0 = time.time()
             err = None
@@ -517,10 +549,12 @@ def run_mode(mode: str, config_path: str, scenarios: list[dict],
             max_pt = res.get("max_prompt_tokens", 0) or first_pt
             evalc = res.get("eval_count", 0)
 
-            # Coding scorer
-            code_result = _score_coding_turn(sc["id"], ti, out, t1_code)
-            if ti == 1 and sc["id"] == "coding":
-                t1_code = _extract_python_block(out)
+            # Coding scorer — uses latest code block from any prior turn
+            code_result = _score_coding_turn(sc["id"], ti, out, latest_code)
+            if sc["id"] == "coding":
+                new_code = _extract_python_block(out)
+                if new_code:
+                    latest_code = new_code
 
             row = {
                 "mode": mode,
@@ -634,7 +668,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(HERE.parent / "src" / "cell" / "config.json"))
-    ap.add_argument("--modes", default="compiler,compiler_notools,compiler_notools_strict")
+    ap.add_argument("--modes", default="compiler_notools,compiler_notools_strict")
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--tools", choices=["on", "off"], default="on")
     ap.add_argument("--prompts", help="JSON file: list of {id, gold, turns}")
@@ -644,7 +678,7 @@ def main():
                     help="extra args passed to llama-server (e.g. '--cache-reuse 256')")
     ap.add_argument("--repeat", type=int, default=1,
                     help="run each mode N times for noise measurement (default 1)")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v7_<ts>.json)")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v8_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -689,8 +723,8 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v7_{stamp}",
-        "title": "Context compiler A/B v7 — coding scorer and strict notools",
+        "receipt_id": f"echo_context_compiler_ab_v8_{stamp}",
+        "title": "Context compiler A/B v8 — code carry-forward, intent num_predict, exemption test",
         "timestamp": stamp,
         "config": args.config,
         "llama_server_url": url,

@@ -91,7 +91,7 @@ class Orchestrator:
         self.hint_in_system = os.environ.get(
             "CELL_HINT_IN_SYSTEM", "0").strip().lower() in ("1", "true", "on")
         self.coding_exempt = os.environ.get(
-            "CELL_CODING_EXEMPT", "1").strip().lower() not in ("0", "false", "off")
+            "CELL_CODING_EXEMPT", "0").strip().lower() not in ("0", "false", "off")
 
         self.tool_registry = create_default_registry()
 
@@ -250,7 +250,7 @@ class Orchestrator:
 
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
                   history: list = None, tool_registry: ToolRegistry = None,
-                  system_hint: str = "") -> dict:
+                  system_hint: str = "", num_predict_override: int = None) -> dict:
         """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
 
         Args:
@@ -259,6 +259,7 @@ class Orchestrator:
             tool_registry: Optional override registry (for selective tool loading).
                            Defaults to self.tool_registry.
             system_hint: Extra text appended to the system prompt (e.g., evidence hint).
+            num_predict_override: If set, overrides generation.num_predict for this call.
         """
         active_registry = tool_registry or self.tool_registry
         backend = self._backend_for(model)
@@ -273,10 +274,11 @@ class Orchestrator:
         if history:
             messages.extend(history)
         messages.append({"role": "user", "content": user_input})
+        base_predict = self.gen_opts.get("num_predict", 1024)
         opts = {
             "temperature": self.gen_opts.get("temperature", 0.0),
             "num_ctx": self.gen_opts.get("num_ctx", 4096),
-            "num_predict": self.gen_opts.get("num_predict", 1024),
+            "num_predict": num_predict_override or base_predict,
         }
 
         n_ctx = opts["num_ctx"]
@@ -736,9 +738,16 @@ class Orchestrator:
             sys_hint = ("\nWhen evidence is provided in the user message, "
                         "use it directly. Only call tools if the evidence "
                         "is clearly insufficient.")
+
+        # Intent-specific num_predict: coding needs more tokens for functions.
+        # config.generation.num_predict_by_intent overrides the default.
+        predict_by_intent = self.gen_opts.get("num_predict_by_intent", {})
+        num_predict_override = predict_by_intent.get(intent)
+
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
                                     history=gen_history, tool_registry=active_reg,
-                                    system_hint=sys_hint)
+                                    system_hint=sys_hint,
+                                    num_predict_override=num_predict_override)
 
         # 9. Feed result to memory lane
         self.memory.ingest({
