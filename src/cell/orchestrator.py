@@ -44,13 +44,22 @@ FORCE_COMMIT_MSG = (
 
 # Tools injected per intent when use_tools=True.
 # Keeps prompt small — only what the model needs for this query type.
+#
+# tools_are_evidence: when True, the intent's tools ARE the evidence
+# mechanism (e.g., almanac_evidence queries a pre-computed table).
+# The tools_when_evidence=off guard must not suppress them even if the
+# compiler found receipt keyword hits — those hits are noise for this
+# intent. Read by _should_suppress_tools().
 INTENT_TOOLS = {
-    "coding": ["read_file", "grep", "list_dir", "shell"],
-    "security_triage": ["read_file", "grep", "list_dir", "shell",
-                        "sentinel_triage", "rag_lookup"],
-    "general": ["read_file", "grep", "list_dir", "memory_search"],
-    "reasoning": ["read_file", "memory_search", "rag_lookup"],
-    "hybrid_experiment": ["read_file", "grep", "list_dir", "memory_search"],
+    "coding": {"tools": ["read_file", "grep", "list_dir", "shell"]},
+    "security_triage": {"tools": ["read_file", "grep", "list_dir", "shell",
+                                   "sentinel_triage", "rag_lookup"]},
+    "general": {"tools": ["read_file", "grep", "list_dir", "memory_search"]},
+    "reasoning": {"tools": ["read_file", "memory_search", "rag_lookup"]},
+    "hybrid_experiment": {"tools": ["read_file", "grep", "list_dir", "memory_search"]},
+    "almanac": {"tools": ["almanac_normalize", "almanac_evidence",
+                           "read_file", "memory_search"],
+                "tools_are_evidence": True},
 }
 
 
@@ -152,7 +161,8 @@ class Orchestrator:
 
     def _lean_registry(self, intent: str) -> ToolRegistry:
         """Build a lean tool registry containing only tools relevant to this intent."""
-        tool_names = INTENT_TOOLS.get(intent, INTENT_TOOLS["general"])
+        entry = INTENT_TOOLS.get(intent, INTENT_TOOLS["general"])
+        tool_names = entry["tools"] if isinstance(entry, dict) else entry
         lean = ToolRegistry()
         for name in tool_names:
             if name in self.tool_registry._tools:
@@ -252,7 +262,8 @@ class Orchestrator:
 
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
                   history: list = None, tool_registry: ToolRegistry = None,
-                  system_hint: str = "", num_predict_override: int = None) -> dict:
+                  system_hint: str = "", num_predict_override: int = None,
+                  system_prompt_override: str = None) -> dict:
         """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
 
         Args:
@@ -262,10 +273,11 @@ class Orchestrator:
                            Defaults to self.tool_registry.
             system_hint: Extra text appended to the system prompt (e.g., evidence hint).
             num_predict_override: If set, overrides generation.num_predict for this call.
+            system_prompt_override: If set, replaces the model's default system prompt.
         """
         active_registry = tool_registry or self.tool_registry
         backend = self._backend_for(model)
-        system_prompt = self.roster.get(model, {}).get(
+        system_prompt = system_prompt_override or self.roster.get(model, {}).get(
             "system_prompt", "You are a helpful assistant.")
         if system_hint:
             system_prompt += system_hint
@@ -703,9 +715,19 @@ class Orchestrator:
             receipt_sources = [s for s in compiled["sources"]
                                if s not in ("memory", "fgip.db")]
             evidence_present = bool(receipt_sources)
+            # tools_are_evidence: intent's own tools ARE the evidence
+            # mechanism (declared in INTENT_TOOLS metadata). Suppressing
+            # them on a noise receipt hit would block the only path to
+            # real data. coding_exempt is the legacy flag for the same
+            # concept before the metadata was added.
+            entry = INTENT_TOOLS.get(intent, {})
+            tools_are_evidence = (
+                (isinstance(entry, dict) and entry.get("tools_are_evidence"))
+                or (self.coding_exempt and intent == "coding")
+            )
             if (use_tools and evidence_present
                     and self.tools_when_evidence == "off"
-                    and (not self.coding_exempt or intent != "coding")):
+                    and not tools_are_evidence):
                 use_tools = False
 
             # Build augmented input: evidence FIRST, then question.
@@ -753,10 +775,15 @@ class Orchestrator:
             effective_intent = saved_prior_intent
         num_predict_override = predict_by_intent.get(effective_intent)
 
+        # Intent-specific system prompt (e.g., almanac addresses member as "you").
+        prompt_by_intent = self.gen_opts.get("system_prompt_by_intent", {})
+        sys_prompt_override = prompt_by_intent.get(intent)
+
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
                                     history=gen_history, tool_registry=active_reg,
                                     system_hint=sys_hint,
-                                    num_predict_override=num_predict_override)
+                                    num_predict_override=num_predict_override,
+                                    system_prompt_override=sys_prompt_override)
 
         # 9. Feed result to memory lane
         self.memory.ingest({

@@ -55,6 +55,7 @@ INTENTS = {
     "general":          "General assistance, Q&A, summarization",
     "reasoning":        "Multi-step reasoning, math, logic",
     "hybrid_experiment":"SSM/hybrid architecture experiments",
+    "almanac":          "Member data normalization, evidence table queries",
 }
 
 # Model → intent mapping (default routing table)
@@ -64,6 +65,7 @@ DEFAULT_ROUTES = {
     "general":          "qwen2.5-coder-3b",
     "reasoning":        "qwen2.5-coder-3b",
     "hybrid_experiment":"zamba2-2.7b",
+    "almanac":          "qwen2.5-coder-3b",
 }
 
 

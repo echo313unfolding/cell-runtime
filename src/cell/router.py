@@ -55,7 +55,7 @@ SECURITY_PATTERNS = [
 CODING_PATTERNS = [
     r'\b(write|implement|code|function|class|method|script)\b',
     r'\b(python|javascript|rust|go|java|c\+\+|typescript)\b',
-    r'\b(bug|fix|debug|error|exception|traceback)\b',
+    r'\b(bugs?|fix|debug|errors?|exceptions?|tracebacks?)\b',
     r'\b(refactor|optimize|test|unittest|pytest)\b',
     r'\b(git|commit|branch|merge|rebase|pr|pull.?request)\b',
     r'\b(api|endpoint|server|client|request|response)\b',
@@ -77,6 +77,24 @@ HYBRID_PATTERNS = [
     r'\b(architecture.?experiment|ablation|probe)\b',
 ]
 
+ALMANAC_PATTERNS = [
+    r'\b(almanac|takeout|evidence.?table|member.?data)\b',
+    r'\b(youtube.?history|watch.?history|my.?data|my.?export)\b',
+    r'\b(youtube)\b.*\b(data|channels?|history|signal|quality)\b',
+    r'\b(normalize|normaliz)\b.*\b(data|export|takeout)\b',
+    r'\b(broker|signal.?quality|provenance)\b',
+    r'\b(what.?does.*(source|data|export).*(claim|say|know))\b',
+    r'\b(channel.?affinity|top.?channels)\b',
+    r'\bmy\b.*\b(channels?|watches|viewing|subscriptions?)\b',
+    r'\b(watch|watched)\b.*\b(youtube|channel)\b',
+    r'\b(youtube)\b.*\b(watch|watched|subscription)\b',
+    r'\b(channels?)\b.*\b(watch|most|top|favorite)\b',
+    r'\b(watch|watched)\b.*\bchannels?\b',
+    r'\bhow\s+(much|many|often)\b.*\b(watch|watched)\b.*\b(youtube|channel)\b',
+    r'\b(I|I\'ve)\s+watched\b',
+    r'\bhave\b.*\bwatched\b',
+]
+
 
 def classify(text: str) -> str:
     """Classify input text into an intent category. Pure rules, zero cost."""
@@ -88,6 +106,7 @@ def classify(text: str) -> str:
         "coding": 0,
         "reasoning": 0,
         "hybrid_experiment": 0,
+        "almanac": 0,
     }
 
     for pattern in SECURITY_PATTERNS:
@@ -105,6 +124,10 @@ def classify(text: str) -> str:
     for pattern in HYBRID_PATTERNS:
         if re.search(pattern, text_lower):
             scores["hybrid_experiment"] += 1
+
+    for pattern in ALMANAC_PATTERNS:
+        if re.search(pattern, text_lower):
+            scores["almanac"] += 1
 
     # Pick highest score
     best = max(scores, key=scores.get)
@@ -130,6 +153,7 @@ def route_model(intent: str) -> str:
         "general": "qwen2.5-coder",
         "reasoning": "qwen2.5-coder",
         "hybrid_experiment": "qwen2.5-coder",
+        "almanac": "qwen2.5-coder",
     }.get(intent, "qwen2.5-coder")
 
 
