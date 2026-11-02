@@ -46,6 +46,7 @@ CASES = [
     ("almanac evidence table", "almanac"),
     ("broker comparison for my watch history", "almanac"),
     ("what is my signal quality distribution for my youtube data", "almanac"),
+    ("what is my signal quality distribution", "almanac"),
     ("how much do I watch Lex Fridman on youtube", "almanac"),
     ("how many times have I watched NetworkChuck", "almanac"),
     ("what channels do I watch the most", "almanac"),

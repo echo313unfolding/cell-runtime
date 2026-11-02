@@ -496,16 +496,29 @@ class Orchestrator:
                         tool_calls_log.append({
                             "name": tool_name,
                             "arguments": tool_args,
-                            "result": tool_result[:2000],
+                            "result": tool_result,
+                            "result_sha256": hashlib.sha256(
+                                tool_result.encode()).hexdigest(),
+                            "result_bytes": len(tool_result.encode()),
                         })
                         return _force_commit("no_new_info_repeated_result")
                     seen_result_hashes.add(result_hash)
 
-                tool_calls_log.append({
+                # Receipt stores the complete result + SHA-256.
+                # The model gets a bounded preview (TOOL_RESULT_CAP).
+                full_hash = hashlib.sha256(
+                    tool_result.encode()).hexdigest()
+                truncated = len(tool_result) > 2000
+                log_entry = {
                     "name": tool_name,
                     "arguments": tool_args,
-                    "result": tool_result[:2000],
-                })
+                    "result": tool_result,
+                    "result_sha256": full_hash,
+                    "result_bytes": len(tool_result.encode()),
+                }
+                if truncated:
+                    log_entry["model_preview_chars"] = TOOL_RESULT_CAP
+                tool_calls_log.append(log_entry)
 
                 # Check if this is an escalation request
                 if tool_name == "delegate_to_host":
