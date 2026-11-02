@@ -684,6 +684,7 @@ class Orchestrator:
                 prior_excerpts=self._prior_excerpts if history else None,
             )
             self._prior_excerpts = compiled.get("excerpts", [])
+            saved_prior_intent = self._prior_intent  # capture before overwrite
             self._prior_intent = intent
 
             # v6: suppress tool loop when receipt evidence is present
@@ -727,6 +728,8 @@ class Orchestrator:
             # Raw history is NOT passed — it's compressed into the evidence block
         else:
             evidence_present = False
+            saved_prior_intent = self._prior_intent
+            self._prior_intent = intent
             capsule_ctx = self.memory.get_capsule_prompt()
             augmented_input = user_input + capsule_ctx if capsule_ctx else user_input
             active_reg = None            # _generate falls back to the full registry
@@ -746,8 +749,8 @@ class Orchestrator:
         # Carry coding intent forward on follow-ups so T2/T3 get the budget.
         predict_by_intent = self.gen_opts.get("num_predict_by_intent", {})
         effective_intent = intent
-        if intent not in predict_by_intent and history and getattr(self, '_prior_intent', None) in predict_by_intent:
-            effective_intent = self._prior_intent
+        if intent not in predict_by_intent and history and saved_prior_intent in predict_by_intent:
+            effective_intent = saved_prior_intent
         num_predict_override = predict_by_intent.get(effective_intent)
 
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
