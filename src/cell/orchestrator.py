@@ -11,6 +11,7 @@ Usage:
     python3 orchestrator.py --json "query"
     echo "explain quicksort" | python3 orchestrator.py
 """
+import hashlib
 import json
 import os
 import platform
@@ -30,9 +31,27 @@ from cell.tool_registry import (
 from cell.memory_lane import MemoryLane
 from cell.specialists import create_specialist_registry, find_specialist
 from cell.ask_pass import ask_pass
+from cell.context_compiler import compile_context, summarize_turn
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 MAX_TOOL_TURNS = 5
+CONTEXT_MARGIN = 128          # tokens reserved beyond num_predict
+TOOL_RESULT_CAP = 1200        # max chars per tool result (down from 3000)
+FORCE_COMMIT_MSG = (
+    "You have gathered enough information. Answer the original question now "
+    "from what you have. Do not call any more tools."
+)
+
+# Tools injected per intent when use_tools=True.
+# Keeps prompt small — only what the model needs for this query type.
+INTENT_TOOLS = {
+    "coding": ["read_file", "grep", "list_dir", "shell"],
+    "security_triage": ["read_file", "grep", "list_dir", "shell",
+                        "sentinel_triage", "rag_lookup"],
+    "general": ["read_file", "grep", "list_dir", "memory_search"],
+    "reasoning": ["read_file", "memory_search", "rag_lookup"],
+    "hybrid_experiment": ["read_file", "grep", "list_dir", "memory_search"],
+}
 
 
 class Orchestrator:
@@ -45,6 +64,34 @@ class Orchestrator:
         self.swap_policy = self.config.get("swap_policy", "sticky")
         self.default_model = self.config.get("default_model", "smollm3")
         self.gen_opts = self.config.get("generation", {})
+
+        # Context strategy. Env var wins over config so an A/B harness can
+        # flip it per-process without touching config.json.
+        #   CELL_CONTEXT_COMPILER=0  → legacy capsule + raw history + full registry
+        #   CELL_CONTEXT_COMPILER=1  → CPU-side compiler (default)
+        ctx_cfg = self.config.get("context_compiler", {})
+        env_flag = os.environ.get("CELL_CONTEXT_COMPILER")
+        if env_flag is not None:
+            self.context_compiler_enabled = env_flag.strip().lower() not in ("0", "false", "off", "")
+        else:
+            self.context_compiler_enabled = bool(ctx_cfg.get("enabled", True))
+        self.context_token_budget = int(
+            os.environ.get("CELL_CONTEXT_BUDGET", ctx_cfg.get("token_budget", 1200)))
+
+        # v6 A/B controls. Config sets the default; env var overrides for
+        # harness A/B runs.
+        #   tools_when_evidence: "off" suppresses the tool loop when the
+        #       compiler found receipt evidence. v6 receipt proved this
+        #       cuts wall time 42% with zero retrieval loss.
+        #   CELL_HINT_IN_SYSTEM=1: put the "evidence was retrieved" hint
+        #       in the system prompt (experimental; caused degeneration).
+        self.tools_when_evidence = os.environ.get(
+            "CELL_TOOLS_WHEN_EVIDENCE",
+            ctx_cfg.get("tools_when_evidence", "on")).strip().lower()
+        self.hint_in_system = os.environ.get(
+            "CELL_HINT_IN_SYSTEM", "0").strip().lower() in ("1", "true", "on")
+        self.coding_exempt = os.environ.get(
+            "CELL_CODING_EXEMPT", "0").strip().lower() not in ("0", "false", "off")
 
         self.tool_registry = create_default_registry()
 
@@ -77,6 +124,17 @@ class Orchestrator:
         # Specialist adapters (e.g., Sentinel hybrid stack)
         self.specialists = create_specialist_registry()
 
+        # Receipt excerpts the compiler read on the previous turn of this
+        # session. Follow-up questions ("what were the tok/s?") rarely
+        # keyword-match the receipt they're about; compile_context falls
+        # back to these when the fresh search is empty or weak.
+        # Each entry: {"path": str, "name": str, "excerpt": str}.
+        # The stored excerpt text is reused verbatim on carry-forward so
+        # the byte prefix of the evidence block is identical across turns,
+        # enabling llama-server's prompt cache.
+        self._prior_excerpts: list[dict] = []
+        self._prior_intent: str = None
+
         # Resolve logging paths
         log_cfg = self.config.get("logging", {})
         self.swap_log_path = Path(os.path.expanduser(
@@ -85,6 +143,28 @@ class Orchestrator:
             log_cfg.get("task_dir", "~/receipts/cell/tasks/")))
         self.swap_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.task_dir.mkdir(parents=True, exist_ok=True)
+
+    def reset_session(self):
+        """Start a fresh conversation: clear memory lane and carried excerpts."""
+        self.memory.reset()
+        self._prior_excerpts = []
+        self._prior_intent = None
+
+    def _lean_registry(self, intent: str) -> ToolRegistry:
+        """Build a lean tool registry containing only tools relevant to this intent."""
+        tool_names = INTENT_TOOLS.get(intent, INTENT_TOOLS["general"])
+        lean = ToolRegistry()
+        for name in tool_names:
+            if name in self.tool_registry._tools:
+                info = self.tool_registry._tools[name]
+                lean.register(name, info["handler"], info["description"],
+                              info["args_schema"])
+        # Always include delegate_to_host as escape hatch
+        if "delegate_to_host" in self.tool_registry._tools:
+            info = self.tool_registry._tools["delegate_to_host"]
+            lean.register("delegate_to_host", info["handler"],
+                          info["description"], info["args_schema"])
+        return lean
 
     def _should_swap(self, current: str | None, target: str, intent: str) -> bool:
         """Decide whether to swap models based on policy."""
@@ -134,96 +214,226 @@ class Orchestrator:
         choice = data.get("choices", [{}])[0]
         content = choice.get("message", {}).get("content", "")
         usage = data.get("usage", {})
+        # Two different prompt numbers, and they answer different questions:
+        #   usage.prompt_tokens  — the FULL context the model saw (what counts
+        #                          against n_ctx)
+        #   timings.prompt_n     — tokens llama-server actually EVALUATED this
+        #                          call, i.e. not served from its prompt cache.
+        #                          A constant system prompt is cached after the
+        #                          first call, so prompt_n drops to ~question
+        #                          size on later calls.
+        # Context occupancy must come from usage; speed from timings. (The
+        # first A/B run conflated them and under-reported legacy context 5x.)
+        timings = data.get("timings") or {}
+        full_prompt = usage.get("prompt_tokens") or timings.get("prompt_n", 0)
+        evaluated = timings.get("prompt_n", full_prompt)
         return {
             "content": content,
-            "eval_count": usage.get("completion_tokens", 0),
-            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "eval_count": timings.get("predicted_n",
+                                      usage.get("completion_tokens", 0)),
+            "prompt_tokens": full_prompt,
+            "prompt_evaluated": evaluated,
+            "prompt_cached": max(0, full_prompt - evaluated),
+            "prompt_ms": timings.get("prompt_ms", 0.0),
+            "predicted_ms": timings.get("predicted_ms", 0.0),
         }
 
+    def _tokenize(self, text: str) -> int:
+        """Count tokens via llama-server /tokenize. Falls back to len/2.5."""
+        base_url = self.config.get("llama_server_url", "http://localhost:8080")
+        try:
+            data = self.pool._http(
+                f"{base_url}/tokenize",
+                {"content": text}, timeout=5)
+            tokens = data.get("tokens", [])
+            return len(tokens) if isinstance(tokens, list) else int(tokens)
+        except Exception:
+            return int(len(text) / 2.5)
+
     def _generate(self, model: str, user_input: str, use_tools: bool = False,
-                  history: list = None) -> dict:
+                  history: list = None, tool_registry: ToolRegistry = None,
+                  system_hint: str = "", num_predict_override: int = None) -> dict:
         """Generate via the appropriate backend. If use_tools, run a multi-turn tool loop.
 
         Args:
             history: Optional list of prior {"role": ..., "content": ...} messages
                      for multi-turn chat. Inserted between system prompt and current user turn.
+            tool_registry: Optional override registry (for selective tool loading).
+                           Defaults to self.tool_registry.
+            system_hint: Extra text appended to the system prompt (e.g., evidence hint).
+            num_predict_override: If set, overrides generation.num_predict for this call.
         """
+        active_registry = tool_registry or self.tool_registry
         backend = self._backend_for(model)
         system_prompt = self.roster.get(model, {}).get(
             "system_prompt", "You are a helpful assistant.")
+        if system_hint:
+            system_prompt += system_hint
         if use_tools:
-            system_prompt += self.tool_registry.format_for_prompt()
+            system_prompt += active_registry.format_for_prompt()
 
         messages = [{"role": "system", "content": system_prompt}]
         if history:
             messages.extend(history)
         messages.append({"role": "user", "content": user_input})
+        base_predict = self.gen_opts.get("num_predict", 1024)
         opts = {
             "temperature": self.gen_opts.get("temperature", 0.0),
             "num_ctx": self.gen_opts.get("num_ctx", 4096),
-            "num_predict": self.gen_opts.get("num_predict", 1024),
+            "num_predict": num_predict_override or base_predict,
         }
+
+        n_ctx = opts["num_ctx"]
+        num_predict = opts["num_predict"]
 
         total_eval_count = 0
         total_eval_duration = 0
+        total_prompt_tokens = 0
+        total_prompt_ms = 0.0
+        first_prompt_tokens = None   # FULL context of the first call (vs n_ctx)
+        first_prompt_evaluated = None  # of which, tokens not served from cache
+        max_prompt_tokens = 0        # largest context any call in the loop saw
+        timings_measured = False
         tool_calls_log = []
         data = None
+        context_ceiling_hit = False
+        stagnation_hit = False
+        seen_call_hashes = set()     # (tool_name, sorted_args) → stagnation
+        seen_result_hashes = set()   # result hash → no-new-info
 
-        for turn in range(MAX_TOOL_TURNS if use_tools else 1):
+        def _result(content: str, **extra) -> dict:
+            out = {
+                "content": content,
+                "eval_count": total_eval_count,
+                "eval_duration": total_eval_duration,
+                "prompt_eval_duration": (
+                    int(total_prompt_ms * 1e6) if timings_measured
+                    else (data.get("prompt_eval_duration", 0)
+                          if backend == "ollama" and data else 0)),
+                "total_duration": (
+                    data.get("total_duration", 0)
+                    if backend == "ollama" and data else 0),
+                "prompt_tokens": total_prompt_tokens,
+                "first_prompt_tokens": first_prompt_tokens or 0,
+                "first_prompt_evaluated": first_prompt_evaluated or 0,
+                "max_prompt_tokens": max_prompt_tokens,
+                "prompt_ms": round(total_prompt_ms, 1),
+                "timings_measured": timings_measured,
+                "tool_calls": tool_calls_log,
+                "context_ceiling_hit": context_ceiling_hit,
+                "stagnation": stagnation_hit,
+            }
+            out.update(extra)
+            return out
+
+        def _count_tokens(text: str) -> int:
+            """Token count via /tokenize, or conservative char estimate."""
+            if backend == "llama-server":
+                return self._tokenize(text)
+            return int(len(text) / 2.5)
+
+        def _record_call(hx_or_data):
+            """Update running accumulators after an _openai_chat or ollama call."""
+            nonlocal total_eval_count, total_eval_duration, total_prompt_tokens
+            nonlocal total_prompt_ms, first_prompt_tokens, first_prompt_evaluated
+            nonlocal max_prompt_tokens, timings_measured, data
+            if backend in ("helix", "llama-server"):
+                hx = hx_or_data
+                total_eval_count += hx["eval_count"]
+                total_prompt_tokens += hx.get("prompt_tokens", 0)
+                max_prompt_tokens = max(max_prompt_tokens, hx.get("prompt_tokens", 0))
+                if first_prompt_tokens is None:
+                    first_prompt_tokens = hx.get("prompt_tokens", 0)
+                    first_prompt_evaluated = hx.get("prompt_evaluated", first_prompt_tokens)
+                if hx.get("predicted_ms"):
+                    total_eval_duration += int(hx["predicted_ms"] * 1e6)
+                    total_prompt_ms += hx.get("prompt_ms", 0.0)
+                    timings_measured = True
+                else:
+                    rated_toks = self.roster.get(model, {}).get("tok_s", 10)
+                    est_dur_ns = int(hx["eval_count"] / rated_toks * 1e9) if rated_toks else 0
+                    total_eval_duration += est_dur_ns
+            else:
+                data = hx_or_data
+                total_eval_count += data.get("eval_count", 0)
+                total_eval_duration += data.get("eval_duration", 0)
+
+        def _call_model(msgs, max_tok=None):
+            """Single model call through appropriate backend. Returns content string."""
+            if max_tok is None:
+                max_tok = num_predict
             if backend in ("helix", "llama-server"):
                 base_url = (self.config.get("llama_server_url", "http://localhost:8080")
                             if backend == "llama-server"
                             else self.config.get("helix_url", "http://localhost:8001"))
-                hx = self._openai_chat(base_url,
-                                       messages, max_tokens=opts["num_predict"],
+                hx = self._openai_chat(base_url, msgs, max_tokens=max_tok,
                                        temperature=opts["temperature"])
-                content = hx["content"]
-                total_eval_count += hx["eval_count"]
-                rated_toks = self.roster.get(model, {}).get("tok_s", 10)
-                est_dur_ns = int(hx["eval_count"] / rated_toks * 1e9) if rated_toks else 0
-                total_eval_duration += est_dur_ns
+                _record_call(hx)
+                return hx["content"]
             else:
                 payload = {
                     "model": model,
-                    "messages": messages,
+                    "messages": msgs,
                     "stream": False,
-                    "options": opts,
+                    "options": {**opts, "num_predict": max_tok},
                 }
-                data = self.pool._api("api/chat", payload, timeout=300)
-                msg = data.get("message", {})
-                content = msg.get("content", "")
-                total_eval_count += data.get("eval_count", 0)
-                total_eval_duration += data.get("eval_duration", 0)
+                d = self.pool._api("api/chat", payload, timeout=300)
+                _record_call(d)
+                return d.get("message", {}).get("content", "")
+
+        def _force_commit(reason: str) -> dict:
+            """MorphSAT-style force commit: one final answer call, no tools."""
+            nonlocal context_ceiling_hit, stagnation_hit
+            if "ceiling" in reason:
+                context_ceiling_hit = True
+            if "stagnation" in reason or "no_new_info" in reason:
+                stagnation_hit = True
+            # Estimate how many tokens we can still generate.
+            # Subtract ~64 for FORCE_COMMIT_MSG + any pending assistant
+            # content already in messages that max_prompt_tokens doesn't
+            # reflect yet.
+            remaining = n_ctx - max_prompt_tokens - CONTEXT_MARGIN - 64
+            commit_budget = max(32, min(remaining, num_predict))
+            # Force-commit message tells the model to answer, not tool-call
+            messages.append({"role": "user", "content": FORCE_COMMIT_MSG})
+            try:
+                answer = _call_model(messages, max_tok=commit_budget)
+            except Exception:
+                answer = f"[context ceiling reached: {reason}]"
+            return _result(answer, force_commit=reason)
+
+        for turn in range(MAX_TOOL_TURNS if use_tools else 1):
+            content = _call_model(messages)
 
             if not use_tools:
-                return {
-                    "content": content,
-                    "eval_count": total_eval_count,
-                    "eval_duration": total_eval_duration,
-                    "prompt_eval_duration": data.get("prompt_eval_duration", 0) if backend == "ollama" and data else 0,
-                    "total_duration": data.get("total_duration", 0) if backend == "ollama" and data else 0,
-                    "tool_calls": [],
-                }
+                return _result(content)
 
             # Check for tool calls
             calls = parse_tool_calls(content)
             if not calls:
                 # No tool calls — model is done
-                return {
-                    "content": content,
-                    "eval_count": total_eval_count,
-                    "eval_duration": total_eval_duration,
-                    "prompt_eval_duration": data.get("prompt_eval_duration", 0) if backend == "ollama" and data else 0,
-                    "total_duration": data.get("total_duration", 0) if backend == "ollama" and data else 0,
-                    "tool_calls": tool_calls_log,
-                }
+                return _result(content)
 
             # Execute tool calls and feed results back
             messages.append({"role": "assistant", "content": content})
             escalations = []
+            # pending_tokens: tokens appended to messages THIS turn that
+            # haven't been reflected in max_prompt_tokens yet (which only
+            # updates on the next _call_model). Includes the assistant
+            # fence (content) plus each tool result we append below.
+            # The assistant fence is roughly the last call's predicted_n.
+            pending_tokens = _count_tokens(content)
             for tc in calls:
                 tool_name = tc.get("name", "")
                 tool_args = tc.get("arguments", {})
+
+                # Stagnation: repeated (tool_name, args) pair
+                call_sig = hashlib.md5(
+                    json.dumps([tool_name, tool_args], sort_keys=True
+                               ).encode()).hexdigest()[:8]
+                if call_sig in seen_call_hashes:
+                    return _force_commit("stagnation_repeated_call")
+                seen_call_hashes.add(call_sig)
 
                 # ask-pass gate for privileged actions
                 if not ask_pass(tool_name, json.dumps(tool_args)):
@@ -238,7 +448,31 @@ class Orchestrator:
                     })
                     continue
 
-                tool_result = self.tool_registry.execute(tool_name, tool_args)
+                tool_result = active_registry.execute(tool_name, tool_args)
+
+                # No-new-info: identical result from different call.
+                # Skip for short results — empty dirs, grep misses, etc.
+                # all hash equal and would false-positive.
+                # Also skip error strings — identical errors from different
+                # calls mean the model is hitting a constraint, not that
+                # there's no new information.  The call-hash still catches
+                # a genuine loop (same tool + same args).
+                result_lower = tool_result.lower()
+                if (len(tool_result) >= 40
+                        and not result_lower.startswith(
+                            ("error", "permission", "timeout",
+                             "unknown tool", "tool error", "agent error"))):
+                    result_hash = hashlib.md5(
+                        tool_result.encode()).hexdigest()[:8]
+                    if result_hash in seen_result_hashes:
+                        tool_calls_log.append({
+                            "name": tool_name,
+                            "arguments": tool_args,
+                            "result": tool_result[:2000],
+                        })
+                        return _force_commit("no_new_info_repeated_result")
+                    seen_result_hashes.add(result_hash)
+
                 tool_calls_log.append({
                     "name": tool_name,
                     "arguments": tool_args,
@@ -260,32 +494,32 @@ class Orchestrator:
                     except (json.JSONDecodeError, AttributeError):
                         pass
 
-                messages.append({
-                    "role": "user",
-                    "content": f"Tool result ({tool_name}):\n{tool_result[:3000]}",
-                })
+                # Token ceiling: will this result + next generation fit?
+                # pending_tokens accounts for the assistant fence AND all
+                # tool results already appended this turn.
+                result_tokens = _count_tokens(tool_result[:TOOL_RESULT_CAP])
+                est_next = (max_prompt_tokens + pending_tokens
+                            + result_tokens + num_predict)
+                if est_next > n_ctx - CONTEXT_MARGIN:
+                    # Try to fit a truncated version
+                    available = (n_ctx - CONTEXT_MARGIN - max_prompt_tokens
+                                 - pending_tokens - num_predict)
+                    max_chars = int(available * 2.5)
+                    if max_chars < 200:
+                        return _force_commit("ceiling_no_room")
+                    tool_result = tool_result[:max_chars] + "\n[truncated to fit context]"
+                    result_tokens = _count_tokens(tool_result)
+
+                msg_text = f"Tool result ({tool_name}):\n{tool_result[:TOOL_RESULT_CAP]}"
+                messages.append({"role": "user", "content": msg_text})
+                pending_tokens += _count_tokens(msg_text)
 
             # If there were escalations, include them in the result
             if escalations:
-                return {
-                    "content": content,
-                    "eval_count": total_eval_count,
-                    "eval_duration": total_eval_duration,
-                    "prompt_eval_duration": data.get("prompt_eval_duration", 0) if backend == "ollama" and data else 0,
-                    "total_duration": data.get("total_duration", 0) if backend == "ollama" and data else 0,
-                    "tool_calls": tool_calls_log,
-                    "escalations": escalations,
-                }
+                return _result(content, escalations=escalations)
 
         # Max turns reached
-        return {
-            "content": content,
-            "eval_count": total_eval_count,
-            "eval_duration": total_eval_duration,
-            "prompt_eval_duration": 0,
-            "total_duration": 0,
-            "tool_calls": tool_calls_log,
-        }
+        return _result(content, max_turns_reached=True)
 
     def _log_swap(self, swap_result: dict, task_id: str, intent: str):
         """Append swap event to JSONL log."""
@@ -415,15 +649,114 @@ class Orchestrator:
                 # Specialist not available — fall through to generic path
                 pass
 
-        # 7. Generic path: inject memory capsule and generate
-        capsule_ctx = self.memory.get_capsule_prompt()
-        augmented_input = user_input
-        if capsule_ctx:
-            augmented_input = user_input + capsule_ctx
+        # 7. Build the prompt context. Two modes, selected by
+        #    CELL_CONTEXT_COMPILER (env, default on):
+        #      "1"  compiler  — CPU-side evidence packet, compressed history,
+        #                       lean per-intent tool registry (step 7/8 as of 9b67b64)
+        #      "0"  legacy    — memory capsule appended to input, raw history
+        #                       passed through, full tool registry (pre-9b67b64)
+        #    The legacy path exists so A/B runs can hit the same orchestrator,
+        #    binary and model with only the context strategy varying.
+        context_mode = "compiler" if self.context_compiler_enabled else "legacy"
+        compiled = {"evidence": "", "sources": [], "tokens_est": 0, "searches": []}
+        gen_history = None
 
-        # 8. Generate (with optional tool loop + conversation history)
+        if context_mode == "compiler":
+            history_summary = ""
+            if history:
+                # Compress prior turns into a compact summary (chronological;
+                # compile_context keeps the tail if it has to trim)
+                for i in range(0, len(history) - 1, 2):
+                    if (history[i].get("role") == "user" and
+                            i + 1 < len(history) and
+                            history[i + 1].get("role") == "assistant"):
+                        turn_sum = summarize_turn(
+                            history[i]["content"],
+                            history[i + 1]["content"],
+                        )
+                        if turn_sum:
+                            history_summary += turn_sum + "\n"
+
+            compiled = compile_context(
+                user_input, intent,
+                history_summary=history_summary,
+                token_budget=self.context_token_budget,
+                prior_excerpts=self._prior_excerpts if history else None,
+            )
+            self._prior_excerpts = compiled.get("excerpts", [])
+            saved_prior_intent = self._prior_intent  # capture before overwrite
+            self._prior_intent = intent
+
+            # v6: suppress tool loop when receipt evidence is present
+            # (CELL_TOOLS_WHEN_EVIDENCE=off).
+            #
+            # evidence_present means the compiler found actual receipt
+            # excerpts, not just memory or FGIP hits. Memory/FGIP add
+            # "memory" and "fgip.db" to sources but those aren't answers
+            # to the question — only receipt excerpts are.
+            #
+            # Coding exempt: "fix this file" needs read_file/grep/shell
+            # even when a receipt filename coincidentally matches a word
+            # in the question ("fixture" → wp_runtime_001_fixture.json).
+            # The classifier's code-keyword regexes are tightened (0007)
+            # so receipt questions no longer false-positive as coding.
+            receipt_sources = [s for s in compiled["sources"]
+                               if s not in ("memory", "fgip.db")]
+            evidence_present = bool(receipt_sources)
+            if (use_tools and evidence_present
+                    and self.tools_when_evidence == "off"
+                    and (not self.coding_exempt or intent != "coding")):
+                use_tools = False
+
+            # Build augmented input: evidence FIRST, then question.
+            # Evidence goes at the front so the carried excerpts form a
+            # byte-stable prefix across T2/T3, letting llama-server's
+            # prompt cache cover them.
+            augmented_input = user_input
+            hint = ""
+            if compiled["evidence"]:
+                if use_tools and evidence_present and not self.hint_in_system:
+                    hint = ("\nEvidence above was retrieved for you; "
+                            "call tools only if it is insufficient.\n")
+                augmented_input = (
+                    f"--- Evidence (retrieved from local files) ---\n"
+                    f"{compiled['evidence']}\n"
+                    f"--- End evidence ---\n{hint}\n"
+                    f"{user_input}"
+                )
+            active_reg = self._lean_registry(intent) if use_tools else None
+            # Raw history is NOT passed — it's compressed into the evidence block
+        else:
+            evidence_present = False
+            saved_prior_intent = self._prior_intent
+            self._prior_intent = intent
+            capsule_ctx = self.memory.get_capsule_prompt()
+            augmented_input = user_input + capsule_ctx if capsule_ctx else user_input
+            active_reg = None            # _generate falls back to the full registry
+            gen_history = history
+
+        # 8. Generate (with optional tool loop)
+        # When hint_in_system is on, the hint goes into the system prompt
+        # instead of the user turn (v6 arm: measure whether system-prompt
+        # placement reduces unnecessary tool calls).
+        sys_hint = ""
+        if self.hint_in_system and evidence_present and context_mode == "compiler":
+            sys_hint = ("\nWhen evidence is provided in the user message, "
+                        "use it directly. Only call tools if the evidence "
+                        "is clearly insufficient.")
+
+        # Intent-specific num_predict: coding needs more tokens for functions.
+        # Carry coding intent forward on follow-ups so T2/T3 get the budget.
+        predict_by_intent = self.gen_opts.get("num_predict_by_intent", {})
+        effective_intent = intent
+        if intent not in predict_by_intent and history and saved_prior_intent in predict_by_intent:
+            effective_intent = saved_prior_intent
+        num_predict_override = predict_by_intent.get(effective_intent)
+
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
-                                    history=history)
+                                    history=gen_history, tool_registry=active_reg,
+                                    system_hint=sys_hint,
+                                    num_predict_override=num_predict_override)
 
         # 9. Feed result to memory lane
         self.memory.ingest({
@@ -466,8 +799,25 @@ class Orchestrator:
             "tok_s": round(tok_s, 2),
             "ttft_ns": gen_result.get("prompt_eval_duration", 0),
             "total_duration_ns": gen_result.get("total_duration", 0),
+            # Measured by llama-server when timings_measured is True;
+            # otherwise estimated from the roster tok_s.
+            "prompt_tokens": gen_result.get("prompt_tokens", 0),
+            "first_prompt_tokens": gen_result.get("first_prompt_tokens", 0),
+            "first_prompt_evaluated": gen_result.get("first_prompt_evaluated", 0),
+            "max_prompt_tokens": gen_result.get("max_prompt_tokens", 0),
+            "prompt_ms": gen_result.get("prompt_ms", 0.0),
+            "timings_measured": gen_result.get("timings_measured", False),
+            "context_ceiling_hit": gen_result.get("context_ceiling_hit", False),
+            "stagnation": gen_result.get("stagnation", False),
+            "force_commit": gen_result.get("force_commit"),
         }
         task_dict["specialist_adapter_used"] = False
+        task_dict["context_mode"] = context_mode
+        task_dict["context_compiled"] = {
+            "tokens_est": compiled["tokens_est"],
+            "sources": compiled["sources"],
+            "searches": compiled["searches"],
+        }
         if tool_calls:
             task_dict["tool_calls"] = tool_calls
         if escalations:
@@ -494,6 +844,21 @@ class Orchestrator:
             "tool_calls": len(tool_calls),
             "receipt": str(task_path),
             "memory_turn": self.memory.state.get("turn_count", 0),
+            "context_mode": context_mode,
+            "prompt_tokens": gen_result.get("prompt_tokens", 0),
+            "first_prompt_tokens": gen_result.get("first_prompt_tokens", 0),
+            "first_prompt_evaluated": gen_result.get("first_prompt_evaluated", 0),
+            "max_prompt_tokens": gen_result.get("max_prompt_tokens", 0),
+            "prompt_ms": gen_result.get("prompt_ms", 0.0),
+            "timings_measured": gen_result.get("timings_measured", False),
+            "context_compiled": {
+                "tokens_est": compiled["tokens_est"],
+                "sources": compiled["sources"],
+                "searches": compiled["searches"],
+            },
+            "context_ceiling_hit": gen_result.get("context_ceiling_hit", False),
+            "stagnation": gen_result.get("stagnation", False),
+            "force_commit": gen_result.get("force_commit"),
         }
         if escalations:
             result["escalations"] = escalations

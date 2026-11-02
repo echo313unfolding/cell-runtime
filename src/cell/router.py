@@ -59,7 +59,8 @@ CODING_PATTERNS = [
     r'\b(refactor|optimize|test|unittest|pytest)\b',
     r'\b(git|commit|branch|merge|rebase|pr|pull.?request)\b',
     r'\b(api|endpoint|server|client|request|response)\b',
-    r'(^|\s)(import |from [a-z_]\w+ import|def |class |return |if |for |while )',
+    r'(^|\s)(import \w|from [a-z_]\w+ import )',
+    r'\bdef \w+\s*\(', r'\bfor \w+ in \w+[\.\[\(:]', r'\bwhile\s+\w+\s*[=<>!:\(]',
     r'\b(dockerfile|docker|kubernetes|k8s|helm)\b',
     r'\b(pip|npm|cargo|make|cmake|gcc)\b',
 ]

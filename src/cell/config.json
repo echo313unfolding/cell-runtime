@@ -1,0 +1,39 @@
+{
+  "_schema": "cell_config.v1",
+  "_note": "Local Echo config — AF6 Qwen via llama-cpp-stage1, localhost only.",
+  "llama_server_url": "http://localhost:8090",
+  "roster": {
+    "qwen2.5-coder": {
+      "backend": "llama-server",
+      "gguf": "~/models/qwen2.5-coder-3b-hxq-affine6.gguf",
+      "intents": ["coding", "general", "reasoning"],
+      "system_prompt": "You are a coding assistant. Write clean, correct, well-structured code. Include brief explanations when helpful.",
+      "tok_s": 37.0,
+      "bpw": 6.28,
+      "size_gib": 2.26
+    }
+  },
+  "memory_lane": {
+    "enabled": true,
+    "llm_enhanced": false
+  },
+  "context_compiler": {
+    "enabled": true,
+    "token_budget": 1200,
+    "tools_when_evidence": "off"
+  },
+  "default_model": "qwen2.5-coder",
+  "swap_policy": "sticky",
+  "generation": {
+    "temperature": 0.0,
+    "num_ctx": 16384,
+    "num_predict": 256,
+    "num_predict_by_intent": {"coding": 512},
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0"
+  },
+  "logging": {
+    "swap_log": "~/receipts/cell/swap_log.jsonl",
+    "task_dir": "~/receipts/cell/tasks/"
+  }
+}
