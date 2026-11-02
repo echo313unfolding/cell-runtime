@@ -133,6 +133,7 @@ class Orchestrator:
         # the byte prefix of the evidence block is identical across turns,
         # enabling llama-server's prompt cache.
         self._prior_excerpts: list[dict] = []
+        self._prior_intent: str = None
 
         # Resolve logging paths
         log_cfg = self.config.get("logging", {})
@@ -147,6 +148,7 @@ class Orchestrator:
         """Start a fresh conversation: clear memory lane and carried excerpts."""
         self.memory.reset()
         self._prior_excerpts = []
+        self._prior_intent = None
 
     def _lean_registry(self, intent: str) -> ToolRegistry:
         """Build a lean tool registry containing only tools relevant to this intent."""
@@ -682,6 +684,7 @@ class Orchestrator:
                 prior_excerpts=self._prior_excerpts if history else None,
             )
             self._prior_excerpts = compiled.get("excerpts", [])
+            self._prior_intent = intent
 
             # v6: suppress tool loop when receipt evidence is present
             # (CELL_TOOLS_WHEN_EVIDENCE=off).
@@ -740,9 +743,12 @@ class Orchestrator:
                         "is clearly insufficient.")
 
         # Intent-specific num_predict: coding needs more tokens for functions.
-        # config.generation.num_predict_by_intent overrides the default.
+        # Carry coding intent forward on follow-ups so T2/T3 get the budget.
         predict_by_intent = self.gen_opts.get("num_predict_by_intent", {})
-        num_predict_override = predict_by_intent.get(intent)
+        effective_intent = intent
+        if intent not in predict_by_intent and history and getattr(self, '_prior_intent', None) in predict_by_intent:
+            effective_intent = self._prior_intent
+        num_predict_override = predict_by_intent.get(effective_intent)
 
         gen_result = self._generate(model, augmented_input, use_tools=use_tools,
                                     history=gen_history, tool_registry=active_reg,

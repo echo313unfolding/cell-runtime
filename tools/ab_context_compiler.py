@@ -204,22 +204,26 @@ def _score_coding_t1(output: str) -> dict:
     except SyntaxError as e:
         return {"code_score": 1, "detail": f"syntax error: {e}"}
 
-    # Run in subprocess with fixture
+    # Run in subprocess with fixture — try fn(list) first, fall back to fn(path)
     fixture = json.dumps([
         {"model_filename": "zamba2.gguf", "test": "pp512", "avg_ts": 311.2},
         {"model_filename": "zamba2.gguf", "test": "tg128", "avg_ts": 37.4},
     ])
     test_script = (
         f"{code}\n\n"
-        f"import json, sys\n"
+        f"import json, sys, tempfile, types, inspect\n"
         f"data = json.loads({fixture!r})\n"
-        f"# Find the function name — first def at module level\n"
-        f"import types\n"
         f"funcs = [v for v in dir() if callable(eval(v)) and not v.startswith('_') and isinstance(eval(v), types.FunctionType)]\n"
         f"assert funcs, 'no function found'\n"
         f"fn = eval(funcs[0])\n"
-        f"# Try calling with the list\n"
-        f"result = fn(data)\n"
+        f"sig = inspect.signature(fn)\n"
+        f"first_param = list(sig.parameters.values())[0].name if sig.parameters else ''\n"
+        f"if first_param in ('file_path', 'path', 'filepath', 'filename', 'json_file'):\n"
+        f"    tf = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)\n"
+        f"    json.dump(data, tf); tf.close()\n"
+        f"    result = fn(tf.name)\n"
+        f"else:\n"
+        f"    result = fn(data)\n"
         f"assert isinstance(result, dict), f'expected dict, got {{type(result).__name__}}'\n"
         f"assert 'pp512' in result or 'tg128' in result, f'expected test names in keys, got {{list(result.keys())}}'\n"
         f"print('PASS')\n"
@@ -678,7 +682,7 @@ def main():
                     help="extra args passed to llama-server (e.g. '--cache-reuse 256')")
     ap.add_argument("--repeat", type=int, default=1,
                     help="run each mode N times for noise measurement (default 1)")
-    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v8_<ts>.json)")
+    ap.add_argument("--out", help="receipt path (default ~/receipts/cell/echo_context_compiler_ab_v9_<ts>.json)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -723,8 +727,8 @@ def main():
 
     summary = summarize(rows)
     receipt = {
-        "receipt_id": f"echo_context_compiler_ab_v8_{stamp}",
-        "title": "Context compiler A/B v8 — code carry-forward, intent num_predict, exemption test",
+        "receipt_id": f"echo_context_compiler_ab_v9_{stamp}",
+        "title": "Context compiler A/B v9 — fixture fix, intent carry, coding confirmation",
         "timestamp": stamp,
         "config": args.config,
         "llama_server_url": url,
