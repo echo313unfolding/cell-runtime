@@ -82,7 +82,7 @@ ALMANAC_PATTERNS = [
     r'\b(youtube.?history|watch.?history|my.?export)\b',
     r'\b(youtube)\b.*\b(data|channels?|history|signal|quality)\b',
     r'\b(normalize|normaliz)\b.*\b(data|export|takeout)\b',
-    r'\b(broker|signal.?quality|provenance)\b',
+    r'\b(broker|signal.?quality.?distribution|provenance)\b',
     r'\b(what.?does.*(source|data|export).*(claim|say|know))\b',
     r'\b(channel.?affinity|top.?channels)\b',
     r'\bmy\b.*\b(channels?|watches|viewing|subscriptions?|signal.?quality)\b',

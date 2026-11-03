@@ -1,14 +1,29 @@
 """Vault agent — member review gate for evidence records.
 
-Pipeline: evidence → member review → vault encrypt → transaction record.
+Two-phase approval protocol:
+  1. store  → computes evidence hash, returns review summary (no write)
+  2. commit → requires exact evidence_hash + approval_scope="storage_only",
+              verifies hash matches current evidence, then encrypts + stores
 
-The vault_review agent is PRIVILEGED — the orchestrator gates it through
-ask_pass, which is the member approval step. The member sees what's being
-vaulted and explicitly approves before encryption happens.
+The hash-binding check in commit is in the agent code. It cannot be
+bypassed by CELL_ASK_PASS=0, session "allow all", or any other
+orchestrator-level gate. The member must approve the exact bytes
+that will be encrypted.
+
+Approval scope is explicit: "storage_only" authorizes encrypted local
+storage. Licensing and release require separate authorization.
 
 Usage:
-    # Store evidence in vault (requires ask_pass approval)
-    result = agent.execute({"action": "store"})
+    # Phase 1: Review evidence (returns hash + summary, writes nothing)
+    review = agent.execute({"action": "store"})
+    evidence_hash = review.output["evidence_hash"]
+
+    # Phase 2: Commit with hash binding (encrypts + stores)
+    result = agent.execute({
+        "action": "commit",
+        "evidence_hash": evidence_hash,
+        "approval_scope": "storage_only",
+    })
 
     # Verify a vault record
     result = agent.execute({
@@ -35,6 +50,8 @@ VAULT_DIR = Path(os.path.expanduser("~/.almanac/cell_vault"))
 EVIDENCE_DIR = Path(os.path.expanduser("~/receipts/almanac"))
 TRANSACTION_DIR = Path(os.path.expanduser("~/receipts/almanac/transactions"))
 
+VALID_SCOPES = {"storage_only"}
+
 
 def _get_vault_secret() -> str | None:
     """Get vault secret from env or local keyfile. Never logs the value."""
@@ -47,13 +64,54 @@ def _get_vault_secret() -> str | None:
     return None
 
 
-class VaultReviewAgent(AgentBase):
-    """Review evidence and write approved records to the member vault.
+def _load_evidence(evidence_path: str | None) -> tuple[Path, dict, bytes, str]:
+    """Load evidence file, build canonical bundle, compute hash.
 
-    This agent implements the member review gate. The orchestrator calls
-    ask_pass before executing any PRIVILEGED tool — that prompt IS the
-    member review. The member sees the action + detail, and approves or
-    denies. Only approved calls reach execute().
+    Returns (path, evidence_data, evidence_bytes, evidence_hash).
+    Raises ValueError on any problem.
+    """
+    if evidence_path:
+        path = Path(os.path.expanduser(evidence_path))
+    else:
+        path = EVIDENCE_DIR / "latest_evidence_table.json"
+
+    if not path.exists():
+        raise ValueError(f"Evidence not found: {path}")
+
+    try:
+        evidence_data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Cannot read evidence: {e}")
+
+    member_hash = evidence_data.get("member_hash")
+    if not member_hash:
+        raise ValueError(
+            "Evidence table has no member_hash. Run almanac_normalize first.")
+
+    bundle = {
+        "schema": "cell.evidence_table.v1",
+        "source_sha256": evidence_data.get("source_sha256", ""),
+        "total_records": evidence_data.get("total_records", 0),
+        "mapped_records": evidence_data.get("mapped_records", 0),
+        "transform_version": evidence_data.get("transform_version", ""),
+        "member_hash": member_hash,
+        "vaulted_from": str(path),
+        "attributes": evidence_data.get("attributes", []),
+    }
+    evidence_bytes = json.dumps(
+        bundle, sort_keys=True, separators=(",", ":")).encode()
+    evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
+
+    return path, evidence_data, evidence_bytes, evidence_hash
+
+
+class VaultReviewAgent(AgentBase):
+    """Two-phase vault agent: review then commit with hash binding.
+
+    The orchestrator's ask_pass is the outer gate. The agent's own
+    evidence_hash verification is the inner gate — it binds the
+    approval to the exact evidence bytes. No env var or session flag
+    can bypass the inner gate.
 
     The vault uses AES-256-GCM with structure-bound context binding
     (vendored from almanac_core). No raw PII in receipts. The vault_secret
@@ -62,7 +120,8 @@ class VaultReviewAgent(AgentBase):
     name = "vault_review"
     description = (
         "Review and vault evidence records. "
-        "Actions: 'store' (encrypt evidence into vault with member approval), "
+        "Actions: 'store' (review evidence, returns hash + summary), "
+        "'commit' (encrypt + store, requires evidence_hash + approval_scope), "
         "'verify' (load and verify a vault record), "
         "'status' (show vault state)."
     )
@@ -75,20 +134,32 @@ class VaultReviewAgent(AgentBase):
             "action": {
                 "type": "string",
                 "description": (
-                    "Operation: 'store' (vault evidence), "
+                    "Operation: 'store' (review evidence), "
+                    "'commit' (encrypt+store with approval), "
                     "'verify' (check vault record), 'status' (vault info)"
                 ),
             },
             "evidence_path": {
                 "type": "string",
                 "description": (
-                    "Path to evidence file (for store). "
+                    "Path to evidence file (for store/commit). "
                     "Default: latest_evidence_table.json"
                 ),
             },
             "evidence_hash": {
                 "type": "string",
-                "description": "Evidence hash (for verify).",
+                "description": (
+                    "Evidence hash from store phase (required for commit). "
+                    "Also used for verify."
+                ),
+            },
+            "approval_scope": {
+                "type": "string",
+                "description": (
+                    "Authorization scope (required for commit). "
+                    "Must be 'storage_only'. Licensing and release "
+                    "require separate authorization."
+                ),
             },
             "receipt_hash": {
                 "type": "string",
@@ -105,57 +176,109 @@ class VaultReviewAgent(AgentBase):
         action = args.get("action", "").strip().lower()
         if action == "store":
             return self._store(args)
+        elif action == "commit":
+            return self._commit(args)
         elif action == "verify":
             return self._verify(args)
         elif action == "status":
             return self._status()
         return AgentResult(
-            error=f"Unknown action: {action!r}. Use: store, verify, status")
+            error=f"Unknown action: {action!r}. "
+                  f"Use: store, commit, verify, status")
 
     def _store(self, args: dict) -> AgentResult:
-        """Encrypt evidence and store in vault with receipt + transaction."""
-        # Load evidence
-        evidence_path = args.get("evidence_path")
-        if evidence_path:
-            path = Path(os.path.expanduser(evidence_path))
-        else:
-            path = EVIDENCE_DIR / "latest_evidence_table.json"
+        """Phase 1: Compute evidence hash and return review summary.
 
-        if not path.exists():
-            return AgentResult(error=f"Evidence not found: {path}")
+        Writes nothing. The member reviews the evidence_hash, source,
+        record count, and attribute summary. If satisfied, calls commit
+        with the evidence_hash.
+        """
+        try:
+            path, evidence_data, _, evidence_hash = _load_evidence(
+                args.get("evidence_path"))
+        except ValueError as e:
+            return AgentResult(error=str(e))
+
+        # Build review summary (no sensitive data — just metadata)
+        attrs = evidence_data.get("attributes", [])
+        attr_types = {}
+        for a in attrs:
+            name = a.get("attribute_name", "unknown")
+            attr_types[name] = attr_types.get(name, 0) + 1
+
+        return AgentResult(
+            output={
+                "status": "review_pending",
+                "evidence_hash": evidence_hash,
+                "evidence_source": str(path),
+                "member_hash": evidence_data.get("member_hash"),
+                "source_sha256": evidence_data.get("source_sha256", "")[:16] + "...",
+                "total_records": evidence_data.get("total_records", 0),
+                "mapped_records": evidence_data.get("mapped_records", 0),
+                "transform_version": evidence_data.get("transform_version", ""),
+                "attribute_types": attr_types,
+                "instruction": (
+                    "Review the evidence summary above. To approve vault "
+                    "storage, call vault_review with action='commit', "
+                    "evidence_hash='" + evidence_hash + "', "
+                    "approval_scope='storage_only'. "
+                    "This authorizes encrypted local storage only — "
+                    "licensing and release require separate authorization."
+                ),
+            },
+        )
+
+    def _commit(self, args: dict) -> AgentResult:
+        """Phase 2: Verify hash binding and store in vault.
+
+        Requirements (enforced in agent code, not bypassable):
+          - evidence_hash must match current evidence on disk
+          - approval_scope must be "storage_only"
+          - vault secret must be available
+        """
+        # ── Validate approval scope ──
+        approval_scope = args.get("approval_scope", "")
+        if approval_scope not in VALID_SCOPES:
+            return AgentResult(
+                error=f"approval_scope must be one of {VALID_SCOPES}, "
+                      f"got {approval_scope!r}. Licensing and release "
+                      f"require separate authorization.")
+
+        # ── Validate evidence hash binding ──
+        approved_hash = args.get("evidence_hash", "")
+        if not approved_hash:
+            return AgentResult(
+                error="commit requires evidence_hash from the store phase.")
 
         try:
-            evidence_data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            return AgentResult(error=f"Cannot read evidence: {e}")
+            path, evidence_data, evidence_bytes, current_hash = _load_evidence(
+                args.get("evidence_path"))
+        except ValueError as e:
+            return AgentResult(error=str(e))
 
-        member_hash = evidence_data.get("member_hash")
-        if not member_hash:
+        if current_hash != approved_hash:
             return AgentResult(
-                error="Evidence table has no member_hash. Run almanac_normalize first.")
+                error=f"Evidence changed since review. "
+                      f"Approved hash: {approved_hash[:16]}..., "
+                      f"current hash: {current_hash[:16]}.... "
+                      f"Run store again to review the updated evidence.")
 
+        # ── Validate vault secret ──
         secret = _get_vault_secret()
         if not secret:
             return AgentResult(
                 error="No vault secret. Set ALMANAC_VAULT_SECRET env var "
                       "or create ~/.almanac/vault_secret")
 
-        # Wrap evidence in a bundle with provenance
-        bundle = {
-            "schema": "cell.evidence_table.v1",
-            "source_sha256": evidence_data.get("source_sha256", ""),
-            "total_records": evidence_data.get("total_records", 0),
-            "mapped_records": evidence_data.get("mapped_records", 0),
-            "transform_version": evidence_data.get("transform_version", ""),
-            "member_hash": member_hash,
-            "vaulted_from": str(path),
-            "vaulted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "attributes": evidence_data.get("attributes", []),
-        }
-        evidence_bytes = json.dumps(
-            bundle, sort_keys=True, separators=(",", ":")).encode()
+        member_hash = evidence_data["member_hash"]
 
-        # Store
+        # ── Encrypt and store ──
+        # Add vaulted_at timestamp to the bundle (after hash verification,
+        # so the hash was computed on the pre-timestamp bundle — the exact
+        # bytes the member reviewed).
+        # NOTE: We store evidence_bytes as-is (the hash-verified bytes).
+        # The vaulted_at appears only in the transaction record, not in
+        # the encrypted evidence.
         bridge = VaultBridge(self._vault_dir)
         t_start = time.time()
         try:
@@ -164,18 +287,23 @@ class VaultReviewAgent(AgentBase):
                 commitment=member_hash,
                 secret=secret,
                 source="cell_runtime_local",
-                notes=f"Evidence from {path.name}, {evidence_data.get('total_records', '?')} records",
+                notes=(
+                    f"Evidence from {path.name}, "
+                    f"{evidence_data.get('total_records', '?')} records. "
+                    f"Approval scope: {approval_scope}."
+                ),
             )
         except Exception as e:
             return AgentResult(error=f"Vault store failed: {e}")
 
         wall_time = round(time.time() - t_start, 3)
 
-        # Write transaction record
+        # ── Write transaction record ──
         TRANSACTION_DIR.mkdir(parents=True, exist_ok=True)
         transaction = {
             "schema": "cell.vault_transaction.v1",
             "action": "store",
+            "authorization_scope": approval_scope,
             "member_hash": member_hash,
             "evidence_hash": result["evidence_hash"],
             "receipt_hash": result["receipt_hash"],
@@ -188,7 +316,8 @@ class VaultReviewAgent(AgentBase):
             "cost": {"wall_time_s": wall_time},
         }
         tx_hash = hashlib.sha256(
-            json.dumps(transaction, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(transaction, sort_keys=True,
+                       separators=(",", ":")).encode()
         ).hexdigest()
         tx_path = (
             TRANSACTION_DIR
@@ -203,6 +332,7 @@ class VaultReviewAgent(AgentBase):
                 "receipt_hash": result["receipt_hash"],
                 "receipt_id": result["receipt_id"],
                 "chain_position": result["chain_position"],
+                "authorization_scope": approval_scope,
                 "vault_dir": str(self._vault_dir),
                 "transaction_path": str(tx_path),
                 "member_hash": member_hash,

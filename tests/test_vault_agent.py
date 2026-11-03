@@ -1,10 +1,13 @@
-"""Vault agent round-trip tests.
+"""Vault agent approval-binding tests.
 
-Tests the member review → vault store → verify pipeline end-to-end:
-  1. Store evidence in vault (encrypted, receipted)
-  2. Verify round-trip (decrypt, check hashes)
-  3. Status reporting
-  4. Error cases (missing secret, missing evidence, bad hash)
+Acceptance criteria (from user review of 99d5c96):
+  1. Member approves exact evidence hash, source/version, storage scope
+  2. Encryption stores precisely those approved bytes
+  3. Denial creates no evidence blob or transaction
+  4. Changed evidence cannot reuse an earlier approval
+  5. Record explicitly authorizes storage; licensing/release separate
+
+Also tests: status, verify round-trip, error paths.
 
 Usage:
     python3 -m pytest tests/test_vault_agent.py -v
@@ -22,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from cell.agents.vault_agent import VaultReviewAgent, EVIDENCE_DIR, TRANSACTION_DIR
 
 
-# Minimal evidence table for testing
 MOCK_EVIDENCE = {
     "member_hash": "test_member_abc123",
     "source_sha256": "deadbeef" * 8,
@@ -51,7 +53,12 @@ MOCK_EVIDENCE = {
     ],
 }
 
-# Test vault secret (meets 12-char + 4-unique-char requirements)
+MODIFIED_EVIDENCE = {
+    **MOCK_EVIDENCE,
+    "total_records": 200,
+    "mapped_records": 150,
+}
+
 TEST_SECRET = "test-vault-secret-2026!"
 
 
@@ -76,6 +83,17 @@ class TestResults:
         return 0 if self.failed == 0 else 1
 
 
+def _count_blobs(vault_dir):
+    """Count .blob files in vault evidence directory."""
+    d = vault_dir / "evidence"
+    return len(list(d.glob("*.blob"))) if d.exists() else 0
+
+
+def _count_tx(tx_dir):
+    """Count transaction files."""
+    return len(list(tx_dir.glob("tx_*.json"))) if tx_dir.exists() else 0
+
+
 def run_tests():
     r = TestResults()
 
@@ -86,168 +104,293 @@ def run_tests():
         evidence_dir.mkdir()
         tx_dir.mkdir()
 
-        # Write mock evidence table
         evidence_path = evidence_dir / "latest_evidence_table.json"
         evidence_path.write_text(json.dumps(MOCK_EVIDENCE, indent=2))
 
-        # Patch module-level paths
         import cell.agents.vault_agent as mod
         orig_evidence = mod.EVIDENCE_DIR
         orig_tx = mod.TRANSACTION_DIR
         mod.EVIDENCE_DIR = evidence_dir
         mod.TRANSACTION_DIR = tx_dir
 
-        # Set secret via env
         orig_env = os.environ.get("ALMANAC_VAULT_SECRET")
         os.environ["ALMANAC_VAULT_SECRET"] = TEST_SECRET
 
         try:
             agent = VaultReviewAgent(vault_dir=vault_dir)
 
-            # ── Test 1: Status before any vault operations ──
-            r1 = agent.execute({"action": "status"})
-            r.check("status_before_ok", r1.ok, f"error={r1.error}")
-            r.check("status_before_no_vault",
-                     not r1.output.get("initialized"),
-                     f"initialized={r1.output.get('initialized')}")
-            r.check("status_has_secret",
-                     r1.output.get("has_secret") is True,
-                     f"has_secret={r1.output.get('has_secret')}")
-            r.check("status_has_evidence",
-                     r1.output.get("has_evidence_table") is True,
-                     f"has_evidence={r1.output.get('has_evidence_table')}")
+            # ══════════════════════════════════════════════════════════
+            # Acceptance Test 1: Member approves exact evidence hash,
+            #   source/version, and storage scope.
+            # ══════════════════════════════════════════════════════════
 
-            # ── Test 2: Store evidence in vault ──
-            r2 = agent.execute({
+            # Phase 1: store returns review_pending with hash + summary
+            review = agent.execute({
                 "action": "store",
                 "evidence_path": str(evidence_path),
             })
-            r.check("store_ok", r2.ok, f"error={r2.error}")
-            r.check("store_has_evidence_hash",
-                     bool(r2.output.get("evidence_hash")),
-                     f"output={r2.output}")
-            r.check("store_has_receipt_hash",
-                     bool(r2.output.get("receipt_hash")),
-                     f"output={r2.output}")
-            r.check("store_has_receipt_id",
-                     bool(r2.output.get("receipt_id")),
-                     f"output={r2.output}")
-            r.check("store_member_hash",
-                     r2.output.get("member_hash") == "test_member_abc123",
-                     f"member_hash={r2.output.get('member_hash')}")
-            r.check("store_has_transaction",
-                     bool(r2.output.get("transaction_path")),
-                     f"output={r2.output}")
-            r.check("store_receipt_present",
-                     r2.receipt is not None,
-                     "receipt missing")
+            r.check("review_ok", review.ok, f"error={review.error}")
+            r.check("review_pending",
+                     review.output.get("status") == "review_pending",
+                     f"status={review.output.get('status')}")
+            r.check("review_has_hash",
+                     len(review.output.get("evidence_hash", "")) == 64,
+                     f"hash={review.output.get('evidence_hash')}")
+            r.check("review_has_source",
+                     "evidence_source" in review.output,
+                     f"keys={list(review.output.keys())}")
+            r.check("review_has_member",
+                     review.output.get("member_hash") == "test_member_abc123",
+                     f"member={review.output.get('member_hash')}")
+            r.check("review_has_records",
+                     review.output.get("total_records") == 100,
+                     f"records={review.output.get('total_records')}")
+            r.check("review_has_version",
+                     review.output.get("transform_version") == "test_v1",
+                     f"version={review.output.get('transform_version')}")
+            r.check("review_has_attrs",
+                     review.output.get("attribute_types") == {
+                         "interest_channel_affinity": 1,
+                         "signal_quality_distribution": 1,
+                     },
+                     f"attrs={review.output.get('attribute_types')}")
+            r.check("review_has_instruction",
+                     "approval_scope" in review.output.get("instruction", ""),
+                     f"instruction={review.output.get('instruction', '')[:80]}")
 
-            evidence_hash = r2.output.get("evidence_hash", "")
-            receipt_hash = r2.output.get("receipt_hash", "")
+            # No blob or transaction created by store phase
+            r.check("store_no_blob",
+                     _count_blobs(vault_dir) == 0,
+                     f"blobs={_count_blobs(vault_dir)}")
+            r.check("store_no_tx",
+                     _count_tx(tx_dir) == 0,
+                     f"txs={_count_tx(tx_dir)}")
 
-            # Transaction file exists
-            if r2.output.get("transaction_path"):
-                tx_path = Path(r2.output["transaction_path"])
-                r.check("transaction_file_exists",
-                         tx_path.exists(),
-                         f"path={tx_path}")
-                if tx_path.exists():
-                    tx = json.loads(tx_path.read_text())
-                    r.check("transaction_schema",
-                             tx.get("schema") == "cell.vault_transaction.v1",
-                             f"schema={tx.get('schema')}")
-                    r.check("transaction_evidence_hash",
-                             tx.get("evidence_hash") == evidence_hash,
-                             f"hash={tx.get('evidence_hash')}")
+            evidence_hash = review.output["evidence_hash"]
 
-            # ── Test 3: Status after store ──
-            r3 = agent.execute({"action": "status"})
-            r.check("status_after_ok", r3.ok, f"error={r3.error}")
-            r.check("status_after_initialized",
-                     r3.output.get("initialized") is True,
-                     f"initialized={r3.output.get('initialized')}")
-            r.check("status_after_has_blob",
-                     r3.output.get("evidence_blobs", 0) >= 1,
-                     f"blobs={r3.output.get('evidence_blobs')}")
-            r.check("status_after_has_receipt",
-                     r3.output.get("receipts", 0) >= 1,
-                     f"receipts={r3.output.get('receipts')}")
-            r.check("status_after_has_tx",
-                     r3.output.get("transactions", 0) >= 1,
-                     f"transactions={r3.output.get('transactions')}")
+            # ══════════════════════════════════════════════════════════
+            # Acceptance Test 2: Encryption stores precisely approved bytes.
+            # ══════════════════════════════════════════════════════════
 
-            # ── Test 4: Verify the stored record ──
-            r4 = agent.execute({
+            # Phase 2: commit with matching hash + scope
+            commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": evidence_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("commit_ok", commit.ok, f"error={commit.error}")
+            r.check("commit_stored",
+                     commit.output.get("status") == "stored",
+                     f"status={commit.output.get('status')}")
+            r.check("commit_hash_matches",
+                     commit.output.get("evidence_hash") == evidence_hash,
+                     f"hash={commit.output.get('evidence_hash')}")
+            r.check("commit_has_receipt",
+                     bool(commit.output.get("receipt_hash")),
+                     f"receipt={commit.output.get('receipt_hash')}")
+            r.check("commit_blob_created",
+                     _count_blobs(vault_dir) == 1,
+                     f"blobs={_count_blobs(vault_dir)}")
+            r.check("commit_tx_created",
+                     _count_tx(tx_dir) == 1,
+                     f"txs={_count_tx(tx_dir)}")
+
+            # Verify the committed record round-trips correctly
+            stored_receipt_hash = commit.output["receipt_hash"]
+            verify = agent.execute({
                 "action": "verify",
                 "evidence_hash": evidence_hash,
-                "receipt_hash": receipt_hash,
+                "receipt_hash": stored_receipt_hash,
             })
-            r.check("verify_ok", r4.ok, f"error={r4.error}")
-            r.check("verify_status",
-                     r4.output.get("status") == "verified",
-                     f"status={r4.output.get('status')}")
-            r.check("verify_evidence_hash",
-                     r4.output.get("evidence_hash") == evidence_hash,
-                     f"hash={r4.output.get('evidence_hash')}")
-            r.check("verify_bundle_summary",
-                     r4.output.get("bundle_summary", {}).get("schema") == "cell.evidence_table.v1",
-                     f"summary={r4.output.get('bundle_summary')}")
-            r.check("verify_record_count",
-                     r4.output.get("bundle_summary", {}).get("total_records") == 100,
-                     f"records={r4.output.get('bundle_summary', {}).get('total_records')}")
+            r.check("verify_roundtrip_ok", verify.ok, f"error={verify.error}")
+            r.check("verify_status_verified",
+                     verify.output.get("status") == "verified",
+                     f"status={verify.output.get('status')}")
+            r.check("verify_bundle_schema",
+                     verify.output.get("bundle_summary", {}).get("schema")
+                     == "cell.evidence_table.v1",
+                     f"summary={verify.output.get('bundle_summary')}")
+            r.check("verify_bundle_records",
+                     verify.output.get("bundle_summary", {}).get("total_records") == 100,
+                     f"records={verify.output.get('bundle_summary', {}).get('total_records')}")
 
-            # ── Test 5: Verify with wrong receipt hash fails ──
-            r5 = agent.execute({
-                "action": "verify",
-                "evidence_hash": evidence_hash,
-                "receipt_hash": "0000" * 16,
+            # ══════════════════════════════════════════════════════════
+            # Acceptance Test 3: Denial creates no blob or transaction.
+            # ══════════════════════════════════════════════════════════
+
+            # store (review phase) → member decides not to commit
+            blobs_before = _count_blobs(vault_dir)
+            tx_before = _count_tx(tx_dir)
+
+            denial_review = agent.execute({"action": "store"})
+            r.check("denial_review_ok", denial_review.ok,
+                     f"error={denial_review.error}")
+
+            # Member never calls commit. No new artifacts.
+            r.check("denial_no_new_blob",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
+            r.check("denial_no_new_tx",
+                     _count_tx(tx_dir) == tx_before,
+                     f"before={tx_before}, after={_count_tx(tx_dir)}")
+
+            # ══════════════════════════════════════════════════════════
+            # Acceptance Test 4: Changed evidence cannot reuse approval.
+            # ══════════════════════════════════════════════════════════
+
+            # Get approval hash for current evidence
+            pre_change_review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
             })
-            r.check("wrong_receipt_fails",
-                     not r5.ok,
-                     f"ok={r5.ok}, error={r5.error}")
+            old_hash = pre_change_review.output["evidence_hash"]
 
-            # ── Test 6: Verify with wrong evidence hash fails ──
-            r6 = agent.execute({
-                "action": "verify",
-                "evidence_hash": "0000" * 16,
-                "receipt_hash": receipt_hash,
+            # Modify the evidence file
+            evidence_path.write_text(json.dumps(MODIFIED_EVIDENCE, indent=2))
+
+            # Try to commit with the old hash — must fail
+            blobs_before = _count_blobs(vault_dir)
+            stale_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": old_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
             })
-            r.check("wrong_evidence_fails",
-                     not r6.ok,
-                     f"ok={r6.ok}, error={r6.error}")
+            r.check("stale_hash_rejected",
+                     not stale_commit.ok,
+                     f"ok={stale_commit.ok}, error={stale_commit.error}")
+            r.check("stale_hash_error_msg",
+                     "changed" in (stale_commit.error or "").lower(),
+                     f"error={stale_commit.error}")
+            r.check("stale_hash_no_blob",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
 
-            # ── Test 7: Store without secret fails ──
+            # Get new hash and commit correctly
+            new_review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
+            })
+            new_hash = new_review.output["evidence_hash"]
+            r.check("new_hash_different",
+                     new_hash != old_hash,
+                     f"old={old_hash[:16]}, new={new_hash[:16]}")
+
+            new_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": new_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("new_hash_commit_ok", new_commit.ok,
+                     f"error={new_commit.error}")
+
+            # Restore original evidence
+            evidence_path.write_text(json.dumps(MOCK_EVIDENCE, indent=2))
+
+            # ══════════════════════════════════════════════════════════
+            # Acceptance Test 5: Record explicitly authorizes storage;
+            #   licensing and release receive separate authorization.
+            # ══════════════════════════════════════════════════════════
+
+            # Transaction record must have authorization_scope
+            tx_files = sorted(tx_dir.glob("tx_*.json"))
+            r.check("tx_files_exist", len(tx_files) >= 1,
+                     f"count={len(tx_files)}")
+            if tx_files:
+                tx = json.loads(tx_files[-1].read_text())
+                r.check("tx_has_scope",
+                         tx.get("authorization_scope") == "storage_only",
+                         f"scope={tx.get('authorization_scope')}")
+                r.check("tx_schema",
+                         tx.get("schema") == "cell.vault_transaction.v1",
+                         f"schema={tx.get('schema')}")
+
+            # Commit with wrong scope fails
+            review_for_scope = agent.execute({"action": "store"})
+            scope_hash = review_for_scope.output["evidence_hash"]
+
+            bad_scope = agent.execute({
+                "action": "commit",
+                "evidence_hash": scope_hash,
+                "approval_scope": "licensing",
+            })
+            r.check("wrong_scope_rejected",
+                     not bad_scope.ok,
+                     f"ok={bad_scope.ok}, error={bad_scope.error}")
+            r.check("wrong_scope_error_msg",
+                     "storage_only" in (bad_scope.error or ""),
+                     f"error={bad_scope.error}")
+
+            # Commit with empty scope fails
+            no_scope = agent.execute({
+                "action": "commit",
+                "evidence_hash": scope_hash,
+            })
+            r.check("no_scope_rejected",
+                     not no_scope.ok,
+                     f"ok={no_scope.ok}, error={no_scope.error}")
+
+            # Commit without evidence_hash fails
+            no_hash = agent.execute({
+                "action": "commit",
+                "approval_scope": "storage_only",
+            })
+            r.check("no_hash_rejected",
+                     not no_hash.ok,
+                     f"ok={no_hash.ok}, error={no_hash.error}")
+
+            # ══════════════════════════════════════════════════════════
+            # Additional: status, error paths
+            # ══════════════════════════════════════════════════════════
+
+            # Status
+            status = agent.execute({"action": "status"})
+            r.check("status_ok", status.ok, f"error={status.error}")
+            r.check("status_initialized",
+                     status.output.get("initialized") is True,
+                     f"init={status.output.get('initialized')}")
+            r.check("status_has_blobs",
+                     status.output.get("evidence_blobs", 0) >= 2,
+                     f"blobs={status.output.get('evidence_blobs')}")
+
+            # No secret
             del os.environ["ALMANAC_VAULT_SECRET"]
-            r7 = agent.execute({"action": "store"})
-            r.check("no_secret_fails",
-                     not r7.ok and "secret" in (r7.error or "").lower(),
-                     f"ok={r7.ok}, error={r7.error}")
+            no_secret = agent.execute({
+                "action": "commit",
+                "evidence_hash": scope_hash,
+                "approval_scope": "storage_only",
+            })
+            r.check("no_secret_rejected",
+                     not no_secret.ok and "secret" in (no_secret.error or "").lower(),
+                     f"ok={no_secret.ok}, error={no_secret.error}")
             os.environ["ALMANAC_VAULT_SECRET"] = TEST_SECRET
 
-            # ── Test 8: Store with missing evidence fails ──
-            r8 = agent.execute({
+            # Missing evidence
+            missing = agent.execute({
                 "action": "store",
                 "evidence_path": "/nonexistent/path.json",
             })
-            r.check("missing_evidence_fails",
-                     not r8.ok,
-                     f"ok={r8.ok}, error={r8.error}")
+            r.check("missing_evidence_rejected",
+                     not missing.ok,
+                     f"ok={missing.ok}, error={missing.error}")
 
-            # ── Test 9: Unknown action fails ──
-            r9 = agent.execute({"action": "unknown"})
-            r.check("unknown_action_fails",
-                     not r9.ok,
-                     f"ok={r9.ok}, error={r9.error}")
+            # Unknown action
+            unknown = agent.execute({"action": "unknown"})
+            r.check("unknown_action_rejected",
+                     not unknown.ok,
+                     f"ok={unknown.ok}, error={unknown.error}")
 
-            # ── Test 10: Second store creates chain link ──
-            r10 = agent.execute({
-                "action": "store",
-                "evidence_path": str(evidence_path),
+            # Wrong receipt hash in verify
+            bad_verify = agent.execute({
+                "action": "verify",
+                "evidence_hash": evidence_hash,
+                "receipt_hash": "0" * 64,
             })
-            r.check("second_store_ok", r10.ok, f"error={r10.error}")
-            r.check("second_store_chain_position",
-                     r10.output.get("chain_position", -1) >= 1,
-                     f"chain_pos={r10.output.get('chain_position')}")
+            r.check("bad_receipt_verify_rejected",
+                     not bad_verify.ok,
+                     f"ok={bad_verify.ok}, error={bad_verify.error}")
 
         finally:
             mod.EVIDENCE_DIR = orig_evidence

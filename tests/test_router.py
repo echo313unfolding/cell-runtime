@@ -74,6 +74,12 @@ CASES = [
     ("my data structure is broken", "general"),
     ("check my git history", "coding"),
     ("what is my history of contributions", "reasoning"),
+
+    # ── negative: bare "signal quality" without almanac context ──
+    # "signal quality distribution" IS almanac-specific, but bare "signal quality"
+    # is ambiguous (could be Wi-Fi, cellular, etc.). With "my" prefix, ties
+    # break to reasoning (dict order); without "my", no almanac hit at all.
+    ("what is my signal quality on Wi-Fi", "reasoning"),
 ]
 
 
