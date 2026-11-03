@@ -68,6 +68,12 @@ CASES = [
     ("how often should I watch for memory leaks", "general"),
     ("watch the build output for errors", "coding"),
     ("Have you watched for memory leaks in the daemon", "general"),
+
+    # ── negative: generic "my data/history" should NOT be almanac ──
+    ("fix my data structure", "coding"),
+    ("my data structure is broken", "general"),
+    ("check my git history", "coding"),
+    ("what is my history of contributions", "reasoning"),
 ]
 
 

@@ -23,6 +23,7 @@ PRIVILEGED = {
     "shell",
     "delegate_to_host",
     "file_write",
+    "vault_review",
 }
 
 # Actions that auto-approve (no prompt)

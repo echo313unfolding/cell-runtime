@@ -447,9 +447,12 @@ def test_context_ceiling_truncates_result(orch_config, monkeypatch):
     result = o._generate("m", "read big file", use_tools=True, tool_registry=reg)
     # Should NOT have errored out — the result was truncated to fit
     assert result["content"] == "The file contained benchmark data."
-    # Check the logged tool result was capped
-    logged = result["tool_calls"][0]["result"]
-    assert len(logged) <= 2000
+    # Receipt stores the FULL result; preview metadata records what model saw
+    entry = result["tool_calls"][0]
+    assert len(entry["result"]) == 5000  # full result preserved
+    assert entry["result_bytes"] == 5000
+    assert "model_preview_chars" in entry  # truncation recorded
+    assert entry["model_preview_chars"] < 5000
 
 
 def test_context_ceiling_force_commit_when_no_room(orch_config, monkeypatch):

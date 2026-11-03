@@ -58,7 +58,7 @@ INTENT_TOOLS = {
     "reasoning": {"tools": ["read_file", "memory_search", "rag_lookup"]},
     "hybrid_experiment": {"tools": ["read_file", "grep", "list_dir", "memory_search"]},
     "almanac": {"tools": ["almanac_normalize", "almanac_evidence",
-                           "read_file", "memory_search"],
+                           "vault_review", "read_file", "memory_search"],
                 "tools_are_evidence": True},
 }
 
@@ -505,10 +505,9 @@ class Orchestrator:
                     seen_result_hashes.add(result_hash)
 
                 # Receipt stores the complete result + SHA-256.
-                # The model gets a bounded preview (TOOL_RESULT_CAP).
+                # Preview metadata added after model preview is computed.
                 full_hash = hashlib.sha256(
                     tool_result.encode()).hexdigest()
-                truncated = len(tool_result) > 2000
                 log_entry = {
                     "name": tool_name,
                     "arguments": tool_args,
@@ -516,8 +515,6 @@ class Orchestrator:
                     "result_sha256": full_hash,
                     "result_bytes": len(tool_result.encode()),
                 }
-                if truncated:
-                    log_entry["model_preview_chars"] = TOOL_RESULT_CAP
                 tool_calls_log.append(log_entry)
 
                 # Check if this is an escalation request
@@ -551,9 +548,17 @@ class Orchestrator:
                     tool_result = tool_result[:max_chars] + "\n[truncated to fit context]"
                     result_tokens = _count_tokens(tool_result)
 
-                msg_text = f"Tool result ({tool_name}):\n{tool_result[:TOOL_RESULT_CAP]}"
+                model_preview = tool_result[:TOOL_RESULT_CAP]
+                msg_text = f"Tool result ({tool_name}):\n{model_preview}"
                 messages.append({"role": "user", "content": msg_text})
                 pending_tokens += _count_tokens(msg_text)
+
+                # Record what the model actually saw vs the full result.
+                preview_bytes = len(model_preview.encode())
+                if preview_bytes < log_entry["result_bytes"]:
+                    log_entry["model_preview_chars"] = len(model_preview)
+                    log_entry["model_preview_sha256"] = hashlib.sha256(
+                        model_preview.encode()).hexdigest()
 
             # If there were escalations, include them in the result
             if escalations:

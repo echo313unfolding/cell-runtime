@@ -360,6 +360,7 @@ def _register_agent_tools(reg: ToolRegistry):
         SpecialistComputeRouteAgent, ShardListAgent, ShardResourceCheckAgent,
     )
     from cell.agents.almanac_agent import AlmanacNormalizeAgent, AlmanacEvidenceAgent
+    from cell.agents.vault_agent import VaultReviewAgent
 
     agent_reg = AgentRegistry()
     for cls in [RAGLookupAgent, RAGSearchAgent, GraphLookupAgent,
@@ -370,7 +371,8 @@ def _register_agent_tools(reg: ToolRegistry):
                 PatchReviewAgent, ExploitAnalysisAgent, CartridgeListAgent,
                 SpecialistComputeRouteAgent, ShardListAgent,
                 ShardResourceCheckAgent,
-                AlmanacNormalizeAgent, AlmanacEvidenceAgent]:
+                AlmanacNormalizeAgent, AlmanacEvidenceAgent,
+                VaultReviewAgent]:
         agent_reg.register(cls())
 
     def _make_agent_handler(agent_name):
