@@ -39,6 +39,7 @@ dev = [
 [project.scripts]
 cell = "cell.orchestrator:main"
 cell-gateway = "cell.gateway:main"
+almanac = "cell.almanac_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/echo313unfolding/cell-runtime"

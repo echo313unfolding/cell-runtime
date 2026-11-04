@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# almanac — Almanac evidence pipeline CLI
+#
+# Usage:
+#   almanac normalize <takeout-path> [--member-id ID] [--output PATH]
+#   almanac vault store   [--evidence-path PATH]
+#   almanac vault approve [--evidence-path PATH]
+#   almanac vault commit  [--evidence-path PATH]
+#   almanac vault verify  --evidence-hash HASH --receipt-hash HASH
+#   almanac vault status
+#   almanac --help
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$SCRIPT_DIR/../src"
+
+exec env PYTHONPATH="$SRC_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m cell.almanac_cli "$@"
