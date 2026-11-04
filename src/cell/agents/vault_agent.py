@@ -1,49 +1,52 @@
 """Vault agent — member review gate for evidence records.
 
-Two-phase approval protocol:
-  1. store  → computes evidence hash, returns review summary (no write)
-  2. commit → requires exact evidence_hash + approval_scope="storage_only",
-              verifies hash matches current evidence, then encrypts + stores
+Three-phase approval protocol:
+  1. store   → computes evidence hash, returns review summary (no write)
+  2. approve → member creates approval via CLI/interactive prompt (not model)
+  3. commit  → checks approval file + hash binding → encrypts + stores
 
-The hash-binding check in commit is in the agent code. It cannot be
-bypassed by CELL_ASK_PASS=0, session "allow all", or any other
-orchestrator-level gate. The member must approve the exact bytes
-that will be encrypted.
+The approval file is the member's authorization. It is created by
+prompt_member_approval() or create_approval() — neither is exposed as
+a model-callable tool. The model may reference an approval_id but
+cannot create one.
 
-Approval scope is explicit: "storage_only" authorizes encrypted local
-storage. Licensing and release require separate authorization.
+Commit checks (all enforced in agent code, not bypassable):
+  - Valid approval file exists for this evidence_hash + member + scope
+  - Approval HMAC verifies (prevents tampering)
+  - Approval not expired (TTL default: 5 minutes)
+  - Approval not already consumed (single-use)
+  - Evidence hash matches current evidence on disk
+  - approval_scope is "storage_only"
 
 Usage:
-    # Phase 1: Review evidence (returns hash + summary, writes nothing)
+    # Phase 1: Review evidence (writes nothing)
     review = agent.execute({"action": "store"})
     evidence_hash = review.output["evidence_hash"]
 
-    # Phase 2: Commit with hash binding (encrypts + stores)
+    # Phase 2: Member creates approval (NOT a model-callable tool)
+    from cell.vault.approval import create_approval
+    create_approval(vault_dir / "approvals", evidence_hash, member, "storage_only", secret)
+
+    # Phase 3: Commit with hash binding (checks approval → encrypts → stores)
     result = agent.execute({
         "action": "commit",
         "evidence_hash": evidence_hash,
         "approval_scope": "storage_only",
     })
-
-    # Verify a vault record
-    result = agent.execute({
-        "action": "verify",
-        "evidence_hash": "abc123...",
-        "receipt_hash": "def456...",
-    })
-
-    # Check vault status
-    result = agent.execute({"action": "status"})
 """
 
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 from cell.agents.base import AgentBase, AgentResult, Permission
 from cell.vault.bridge import VaultBridge
+from cell.vault.approval import (
+    validate_approval, consume_approval, prompt_member_approval,
+)
 
 # Default paths
 VAULT_DIR = Path(os.path.expanduser("~/.almanac/cell_vault"))
@@ -229,9 +232,11 @@ class VaultReviewAgent(AgentBase):
         )
 
     def _commit(self, args: dict) -> AgentResult:
-        """Phase 2: Verify hash binding and store in vault.
+        """Phase 3: Verify approval + hash binding and store in vault.
 
         Requirements (enforced in agent code, not bypassable):
+          - Valid member approval file exists (hash, member, scope, HMAC, TTL)
+          - Approval not expired and not already consumed (single-use)
           - evidence_hash must match current evidence on disk
           - approval_scope must be "storage_only"
           - vault secret must be available
@@ -272,10 +277,32 @@ class VaultReviewAgent(AgentBase):
 
         member_hash = evidence_data["member_hash"]
 
+        # ── Validate member approval ──
+        approval_dir = self._vault_dir / "approvals"
+        approval = validate_approval(
+            approval_dir=approval_dir,
+            evidence_hash=current_hash,
+            member_hash=member_hash,
+            scope=approval_scope,
+            vault_secret=secret,
+        )
+        if approval is None:
+            return AgentResult(
+                error="No valid member approval found. "
+                      "A member must create an approval before commit. "
+                      "Use prompt_member_approval() or create_approval() "
+                      "(interactive/CLI only, not model-callable).")
+
+        # ── Claim approval atomically (before vault write) ──
+        # Uses os.rename internally — if two concurrent commits race on
+        # the same approval, only one wins the rename. The loser gets
+        # False here and never reaches the vault store.
+        if not consume_approval(approval_dir, approval["approval_id"]):
+            return AgentResult(
+                error="Approval was consumed by another process. "
+                      "Create a new approval and retry.")
+
         # ── Encrypt and store ──
-        # Add vaulted_at timestamp to the bundle (after hash verification,
-        # so the hash was computed on the pre-timestamp bundle — the exact
-        # bytes the member reviewed).
         # NOTE: We store evidence_bytes as-is (the hash-verified bytes).
         # The vaulted_at appears only in the transaction record, not in
         # the encrypted evidence.

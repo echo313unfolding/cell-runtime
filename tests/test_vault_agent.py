@@ -1,13 +1,19 @@
 """Vault agent approval-binding tests.
 
-Acceptance criteria (from user review of 99d5c96):
+Acceptance criteria (from user review of 19e020b + approval gap analysis):
   1. Member approves exact evidence hash, source/version, storage scope
   2. Encryption stores precisely those approved bytes
   3. Denial creates no evidence blob or transaction
   4. Changed evidence cannot reuse an earlier approval
   5. Record explicitly authorizes storage; licensing/release separate
 
-Also tests: status, verify round-trip, error paths.
+Decisive test (approval gap):
+  - Valid hash + available vault secret + no member approval → commit rejected,
+    zero new blobs and transactions, including under CELL_ASK_PASS=0
+  - Explicit denial then commit attempt → rejected
+  - Wrong member → rejected
+  - Expired approval → rejected
+  - Replayed (consumed) approval → rejected
 
 Usage:
     python3 -m pytest tests/test_vault_agent.py -v
@@ -18,11 +24,15 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from cell.agents.vault_agent import VaultReviewAgent, EVIDENCE_DIR, TRANSACTION_DIR
+from cell.vault.approval import (
+    create_approval, validate_approval, consume_approval, APPROVAL_TTL_S,
+)
 
 
 MOCK_EVIDENCE = {
@@ -107,6 +117,8 @@ def run_tests():
         evidence_path = evidence_dir / "latest_evidence_table.json"
         evidence_path.write_text(json.dumps(MOCK_EVIDENCE, indent=2))
 
+        approval_dir = vault_dir / "approvals"
+
         import cell.agents.vault_agent as mod
         orig_evidence = mod.EVIDENCE_DIR
         orig_tx = mod.TRANSACTION_DIR
@@ -120,16 +132,64 @@ def run_tests():
             agent = VaultReviewAgent(vault_dir=vault_dir)
 
             # ══════════════════════════════════════════════════════════
+            # DECISIVE TEST: Valid hash + vault secret + NO member
+            # approval → commit rejected, zero new blobs/transactions.
+            # This is the gap identified in the approval analysis.
+            # ══════════════════════════════════════════════════════════
+
+            review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("decisive_review_ok", review.ok, f"error={review.error}")
+            evidence_hash = review.output["evidence_hash"]
+
+            # Attempt commit WITHOUT creating any approval file
+            blobs_before = _count_blobs(vault_dir)
+            tx_before = _count_tx(tx_dir)
+
+            no_approval_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": evidence_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("no_approval_rejected",
+                     not no_approval_commit.ok,
+                     f"ok={no_approval_commit.ok}, error={no_approval_commit.error}")
+            r.check("no_approval_error_msg",
+                     "approval" in (no_approval_commit.error or "").lower(),
+                     f"error={no_approval_commit.error}")
+            r.check("no_approval_zero_blobs",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
+            r.check("no_approval_zero_tx",
+                     _count_tx(tx_dir) == tx_before,
+                     f"before={tx_before}, after={_count_tx(tx_dir)}")
+
+            # Same test under CELL_ASK_PASS=0 (proves ask_pass bypass
+            # doesn't help — approval is enforced in agent code)
+            os.environ["CELL_ASK_PASS"] = "0"
+            no_approval_askpass0 = agent.execute({
+                "action": "commit",
+                "evidence_hash": evidence_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("no_approval_askpass0_rejected",
+                     not no_approval_askpass0.ok,
+                     f"ok={no_approval_askpass0.ok}")
+            r.check("no_approval_askpass0_zero_blobs",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"blobs={_count_blobs(vault_dir)}")
+            del os.environ["CELL_ASK_PASS"]
+
+            # ══════════════════════════════════════════════════════════
             # Acceptance Test 1: Member approves exact evidence hash,
             #   source/version, and storage scope.
             # ══════════════════════════════════════════════════════════
 
             # Phase 1: store returns review_pending with hash + summary
-            review = agent.execute({
-                "action": "store",
-                "evidence_path": str(evidence_path),
-            })
-            r.check("review_ok", review.ok, f"error={review.error}")
             r.check("review_pending",
                      review.output.get("status") == "review_pending",
                      f"status={review.output.get('status')}")
@@ -166,13 +226,24 @@ def run_tests():
                      _count_tx(tx_dir) == 0,
                      f"txs={_count_tx(tx_dir)}")
 
-            evidence_hash = review.output["evidence_hash"]
-
             # ══════════════════════════════════════════════════════════
-            # Acceptance Test 2: Encryption stores precisely approved bytes.
+            # Acceptance Test 2: Encryption stores precisely approved
+            # bytes. Requires valid member approval.
             # ══════════════════════════════════════════════════════════
 
-            # Phase 2: commit with matching hash + scope
+            # Phase 2: Member creates approval (NOT model-callable)
+            approval = create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=evidence_hash,
+                member_hash="test_member_abc123",
+                scope="storage_only",
+                vault_secret=TEST_SECRET,
+            )
+            r.check("approval_created",
+                     approval is not None and "approval_id" in approval,
+                     f"approval={approval}")
+
+            # Phase 3: commit with matching hash + scope + valid approval
             commit = agent.execute({
                 "action": "commit",
                 "evidence_hash": evidence_hash,
@@ -217,9 +288,11 @@ def run_tests():
 
             # ══════════════════════════════════════════════════════════
             # Acceptance Test 3: Denial creates no blob or transaction.
+            # Two sub-tests: (a) omit commit, (b) attempt commit after
+            # explicit denial (no approval created).
             # ══════════════════════════════════════════════════════════
 
-            # store (review phase) → member decides not to commit
+            # 3a: store (review phase) → member decides not to commit
             blobs_before = _count_blobs(vault_dir)
             tx_before = _count_tx(tx_dir)
 
@@ -235,6 +308,25 @@ def run_tests():
                      _count_tx(tx_dir) == tx_before,
                      f"before={tx_before}, after={_count_tx(tx_dir)}")
 
+            # 3b: Member explicitly denies — then model attempts commit.
+            # No approval file exists, so commit must fail.
+            denial_hash = denial_review.output["evidence_hash"]
+            denial_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": denial_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("denial_commit_rejected",
+                     not denial_commit.ok,
+                     f"ok={denial_commit.ok}, error={denial_commit.error}")
+            r.check("denial_commit_no_blob",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
+            r.check("denial_commit_no_tx",
+                     _count_tx(tx_dir) == tx_before,
+                     f"before={tx_before}, after={_count_tx(tx_dir)}")
+
             # ══════════════════════════════════════════════════════════
             # Acceptance Test 4: Changed evidence cannot reuse approval.
             # ══════════════════════════════════════════════════════════
@@ -246,10 +338,19 @@ def run_tests():
             })
             old_hash = pre_change_review.output["evidence_hash"]
 
+            # Create approval for the OLD hash
+            create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=old_hash,
+                member_hash="test_member_abc123",
+                scope="storage_only",
+                vault_secret=TEST_SECRET,
+            )
+
             # Modify the evidence file
             evidence_path.write_text(json.dumps(MODIFIED_EVIDENCE, indent=2))
 
-            # Try to commit with the old hash — must fail
+            # Try to commit with the old hash — must fail (evidence changed)
             blobs_before = _count_blobs(vault_dir)
             stale_commit = agent.execute({
                 "action": "commit",
@@ -267,7 +368,7 @@ def run_tests():
                      _count_blobs(vault_dir) == blobs_before,
                      f"before={blobs_before}, after={_count_blobs(vault_dir)}")
 
-            # Get new hash and commit correctly
+            # Get new hash and commit correctly with new approval
             new_review = agent.execute({
                 "action": "store",
                 "evidence_path": str(evidence_path),
@@ -276,6 +377,14 @@ def run_tests():
             r.check("new_hash_different",
                      new_hash != old_hash,
                      f"old={old_hash[:16]}, new={new_hash[:16]}")
+
+            create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=new_hash,
+                member_hash="test_member_abc123",
+                scope="storage_only",
+                vault_secret=TEST_SECRET,
+            )
 
             new_commit = agent.execute({
                 "action": "commit",
@@ -307,7 +416,7 @@ def run_tests():
                          tx.get("schema") == "cell.vault_transaction.v1",
                          f"schema={tx.get('schema')}")
 
-            # Commit with wrong scope fails
+            # Commit with wrong scope fails (even with approval for storage_only)
             review_for_scope = agent.execute({"action": "store"})
             scope_hash = review_for_scope.output["evidence_hash"]
 
@@ -340,6 +449,283 @@ def run_tests():
             r.check("no_hash_rejected",
                      not no_hash.ok,
                      f"ok={no_hash.ok}, error={no_hash.error}")
+
+            # ══════════════════════════════════════════════════════════
+            # Wrong member approval → rejected
+            # ══════════════════════════════════════════════════════════
+
+            # Clean stale pending approvals from earlier tests
+            for stale in approval_dir.glob("pending_*.json"):
+                stale.unlink()
+
+            wrong_member_review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
+            })
+            wrong_member_hash = wrong_member_review.output["evidence_hash"]
+
+            # Create approval with WRONG member_hash
+            create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=wrong_member_hash,
+                member_hash="wrong_member_xyz789",
+                scope="storage_only",
+                vault_secret=TEST_SECRET,
+            )
+
+            blobs_before = _count_blobs(vault_dir)
+            wrong_member_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": wrong_member_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("wrong_member_rejected",
+                     not wrong_member_commit.ok,
+                     f"ok={wrong_member_commit.ok}, error={wrong_member_commit.error}")
+            r.check("wrong_member_no_blob",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
+
+            # ══════════════════════════════════════════════════════════
+            # Expired approval → rejected
+            # ══════════════════════════════════════════════════════════
+
+            expired_review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
+            })
+            expired_hash = expired_review.output["evidence_hash"]
+
+            # Create approval with TTL of 0 (already expired)
+            create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=expired_hash,
+                member_hash="test_member_abc123",
+                scope="storage_only",
+                vault_secret=TEST_SECRET,
+                ttl_s=0,
+            )
+            # Small sleep to ensure expiry
+            time.sleep(0.1)
+
+            blobs_before = _count_blobs(vault_dir)
+            expired_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": expired_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("expired_approval_rejected",
+                     not expired_commit.ok,
+                     f"ok={expired_commit.ok}, error={expired_commit.error}")
+            r.check("expired_no_blob",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
+
+            # ══════════════════════════════════════════════════════════
+            # Replayed (consumed) approval → rejected
+            # ══════════════════════════════════════════════════════════
+
+            replay_review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
+            })
+            replay_hash = replay_review.output["evidence_hash"]
+
+            # Create and immediately consume an approval
+            replay_approval = create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=replay_hash,
+                member_hash="test_member_abc123",
+                scope="storage_only",
+                vault_secret=TEST_SECRET,
+            )
+            consume_approval(approval_dir, replay_approval["approval_id"])
+
+            blobs_before = _count_blobs(vault_dir)
+            replay_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": replay_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("replay_rejected",
+                     not replay_commit.ok,
+                     f"ok={replay_commit.ok}, error={replay_commit.error}")
+            r.check("replay_no_blob",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
+
+            # ══════════════════════════════════════════════════════════
+            # Wrong scope approval → rejected
+            # (approval for "storage_only" but commit requests different)
+            # ══════════════════════════════════════════════════════════
+
+            # Already covered by wrong_scope test above (scope rejected
+            # before approval check). Also test: approval exists for
+            # wrong scope, commit requests storage_only.
+            wrong_scope_review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
+            })
+            wrong_scope_hash = wrong_scope_review.output["evidence_hash"]
+
+            # Create approval with scope "licensing" (not storage_only)
+            create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=wrong_scope_hash,
+                member_hash="test_member_abc123",
+                scope="licensing",
+                vault_secret=TEST_SECRET,
+            )
+
+            blobs_before = _count_blobs(vault_dir)
+            wrong_scope_approval_commit = agent.execute({
+                "action": "commit",
+                "evidence_hash": wrong_scope_hash,
+                "approval_scope": "storage_only",
+                "evidence_path": str(evidence_path),
+            })
+            r.check("wrong_scope_approval_rejected",
+                     not wrong_scope_approval_commit.ok,
+                     f"ok={wrong_scope_approval_commit.ok}, error={wrong_scope_approval_commit.error}")
+            r.check("wrong_scope_approval_no_blob",
+                     _count_blobs(vault_dir) == blobs_before,
+                     f"before={blobs_before}, after={_count_blobs(vault_dir)}")
+
+            # ══════════════════════════════════════════════════════════
+            # Concurrent commits: one approval, two threads.
+            # Barrier placed AFTER validate_approval, BEFORE consume_approval
+            # — both threads hold a validated approval dict, then race on
+            # the atomic rename in consume_approval.
+            #
+            # After the race: decrypt the winner's record, then check
+            # whether the earlier record (Test 2) survives the overwrite.
+            # ══════════════════════════════════════════════════════════
+
+            import threading
+            import cell.agents.vault_agent as agent_mod
+
+            # Clean slate
+            for stale in approval_dir.glob("pending_*.json"):
+                stale.unlink()
+
+            conc_review = agent.execute({
+                "action": "store",
+                "evidence_path": str(evidence_path),
+            })
+            conc_hash = conc_review.output["evidence_hash"]
+
+            # One approval for the concurrent race
+            create_approval(
+                approval_dir=approval_dir,
+                evidence_hash=conc_hash,
+                member_hash="test_member_abc123",
+                scope="storage_only",
+                vault_secret=TEST_SECRET,
+            )
+
+            tx_before = _count_tx(tx_dir)
+
+            # Patch consume_approval at the call site so both threads
+            # synchronize AFTER validate_approval returns, right before
+            # the atomic rename.
+            original_consume = agent_mod.consume_approval
+            consume_barrier = threading.Barrier(2)
+
+            def _synced_consume(approval_dir_arg, approval_id_arg):
+                consume_barrier.wait(timeout=5)
+                return original_consume(approval_dir_arg, approval_id_arg)
+
+            agent_mod.consume_approval = _synced_consume
+
+            results_lock = threading.Lock()
+            commit_results = []
+
+            def _do_commit():
+                res = agent.execute({
+                    "action": "commit",
+                    "evidence_hash": conc_hash,
+                    "approval_scope": "storage_only",
+                    "evidence_path": str(evidence_path),
+                })
+                with results_lock:
+                    commit_results.append(res)
+
+            t1 = threading.Thread(target=_do_commit)
+            t2 = threading.Thread(target=_do_commit)
+            t1.start()
+            t2.start()
+            t1.join(timeout=30)
+            t2.join(timeout=30)
+            agent_mod.consume_approval = original_consume
+
+            successes = [cr for cr in commit_results if cr.ok]
+            failures = [cr for cr in commit_results if not cr.ok]
+
+            r.check("concurrent_exactly_one_success",
+                     len(successes) == 1,
+                     f"successes={len(successes)}, failures={len(failures)}")
+            r.check("concurrent_exactly_one_failure",
+                     len(failures) == 1,
+                     f"successes={len(successes)}, failures={len(failures)}")
+            r.check("concurrent_one_new_tx",
+                     _count_tx(tx_dir) == tx_before + 1,
+                     f"before={tx_before}, after={_count_tx(tx_dir)}")
+
+            # Verify the approval was consumed (pending file gone)
+            matching_pending = [
+                p for p in approval_dir.glob("pending_*.json")
+                if json.loads(p.read_text()).get("evidence_hash") == conc_hash
+            ]
+            r.check("concurrent_approval_consumed",
+                     len(matching_pending) == 0,
+                     f"pending approvals remaining: {len(matching_pending)}")
+
+            if failures:
+                err = failures[0].error or ""
+                r.check("concurrent_loser_error_msg",
+                         "consumed" in err.lower() or "approval" in err.lower(),
+                         f"error={err}")
+
+            # ── Receipt integrity after the race ──
+            # The winner's record must decrypt to the expected plaintext.
+            winner_receipt_hash = successes[0].output["receipt_hash"]
+            winner_verify = agent.execute({
+                "action": "verify",
+                "evidence_hash": conc_hash,
+                "receipt_hash": winner_receipt_hash,
+            })
+            r.check("concurrent_winner_verify_ok",
+                     winner_verify.ok,
+                     f"error={winner_verify.error}")
+            r.check("concurrent_winner_plaintext_hash",
+                     winner_verify.output.get("evidence_hash") == conc_hash,
+                     f"hash={winner_verify.output.get('evidence_hash')}")
+            r.check("concurrent_winner_records",
+                     winner_verify.output.get("bundle_summary", {}).get("total_records") == 100,
+                     f"summary={winner_verify.output.get('bundle_summary')}")
+
+            # The earlier record (Test 2) used the same evidence hash.
+            # The blob is content-addressed: the winner overwrote both
+            # {hash}.blob and {hash}.v2.json. However, load() reads
+            # structure context from the .v2.json (co-located with the
+            # ciphertext), not from the receipt. The receipt only checks
+            # evidence_hash match. So earlier receipts remain valid after
+            # overwrite — the metadata+ciphertext pair is internally
+            # consistent regardless of which receipt references it.
+            earlier_verify = agent.execute({
+                "action": "verify",
+                "evidence_hash": evidence_hash,
+                "receipt_hash": stored_receipt_hash,
+            })
+            r.check("earlier_receipt_survives_overwrite",
+                     earlier_verify.ok,
+                     f"error={earlier_verify.error}")
+            r.check("earlier_receipt_same_plaintext",
+                     earlier_verify.output.get("bundle_summary", {}).get("total_records") == 100,
+                     f"summary={earlier_verify.output.get('bundle_summary')}")
 
             # ══════════════════════════════════════════════════════════
             # Additional: status, error paths
@@ -399,6 +785,8 @@ def run_tests():
                 os.environ["ALMANAC_VAULT_SECRET"] = orig_env
             elif "ALMANAC_VAULT_SECRET" in os.environ:
                 del os.environ["ALMANAC_VAULT_SECRET"]
+            if "CELL_ASK_PASS" in os.environ:
+                del os.environ["CELL_ASK_PASS"]
 
     return r
 
